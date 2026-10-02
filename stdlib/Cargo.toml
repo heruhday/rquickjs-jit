@@ -1,0 +1,25 @@
+[package]
+name = "quickjs-jit-stdlib"
+version = "0.12.7"
+edition = "2021"
+rust-version = "1.89"
+license = "MIT"
+description = "Thin facade for LLRT standard modules used with quickjs-jit"
+repository = "https://github.com/longbridge/quickjs-jit"
+readme = "README.md"
+publish = false
+
+[features]
+parallel = ["rquickjs/parallel"]
+
+[dependencies]
+# Use LLRT's binding identity. JIT hosts must patch rquickjs at their workspace root.
+rquickjs = { version = "0.12.2", default-features = false, features = ["futures", "half", "loader", "macro", "std"] }
+llrt_buffer = { git = "https://github.com/awslabs/llrt", rev = "7b95c82a9b15e7ddfb2778eca4b5a63111e74f51" }
+llrt_crypto = { git = "https://github.com/awslabs/llrt", rev = "7b95c82a9b15e7ddfb2778eca4b5a63111e74f51", default-features = false, features = ["crypto-rust"] }
+llrt_path = { git = "https://github.com/awslabs/llrt", rev = "7b95c82a9b15e7ddfb2778eca4b5a63111e74f51" }
+llrt_url = { git = "https://github.com/awslabs/llrt", rev = "7b95c82a9b15e7ddfb2778eca4b5a63111e74f51" }
+llrt_zlib = { git = "https://github.com/awslabs/llrt", rev = "7b95c82a9b15e7ddfb2778eca4b5a63111e74f51", default-features = false, features = ["compression-rust"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "time"] }

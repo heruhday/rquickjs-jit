@@ -1,0 +1,169 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## Unreleased
+
+### Breaking Changes
+
+### Added
+
+- Add `quickjs-jit-stdlib`, a thin facade over external LLRT standard modules, with host-owned JIT compatibility and no bundled LLRT sources.
+
+- Add pre-generated bindings for `riscv64gc-unknown-linux-gnu` and `riscv64a23-unknown-linux-gnu`
+- JIT M2: Tier 1 and Tier 2 now support the remaining comparison, bitwise, shift, `%`, unary
+  numeric, constant, stack-shuffle, tail-call, `null`, and empty-string opcodes; the JIT ABI
+  gains the `BINARY_ARITH_SLOW` and `UNARY_ARITH_SLOW` helpers (ABI minor 19); native entries
+  no longer run the full maintenance pass on every call. See `docs/M2.md`.
+
+### Changed
+
+- Consolidate repeated feedback-table and baseline-tier lookups while preserving feedback versions, capacity behavior, and publication ordering.
+
+- JIT M3: cache one idle native entry handle per runtime with epoch-based
+  invalidation (ABI minor 20), remove native-return queue allocation, and reuse
+  CALL feedback storage. Reuse validated bytecode boundaries during helper PC
+  checks, and reuse one native execution timing stack across functions.
+  Add acquisition metrics, lifecycle regressions, and
+  paired generic-call diagnostics. See `docs/M3.md`.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+- Benchmark forced Tier 2 direct calls only after the required caller/callee
+  publications settle; reject compilation during the timed batch and refresh
+  stale local workload checksums.
+
+### Security
+
+## [0.12.2] - 2026-07-27
+
+### Added
+
+- Added `TypedArray<U8Clamped>` support for `Uint8ClampedArray`, obtainable via `TypedArray::from_object` and matched by `is_typed_array` like other typed array classes
+
+### Fixed
+
+- Fixed `rquickjs-sys` host build failing during cross-compilation by reusing bundled bindings for the host target instead of running bindgen with a mismatched `libclang` #[709](https://github.com/DelSkayn/rquickjs/issues/709)
+
+## [0.12.1] - 2026-06-29
+
+### Changed
+
+- Updated `phf`, `phf_shared` and `phf_generator` to 0.14
+
+### Fixed
+
+- Fixed `Constructor::new_prototype` leaking a reference cycle that aborted `JS_FreeRuntime` with a `gc_obj_list` assertion failure
+
+## [0.12.0] - 2026-05-26
+
+### Breaking Changes
+
+- Added import attributes to the Loader trait #[601](https://github.com/DelSkayn/rquickjs/pull/601)
+- Added half support (f16) for Float16Array # [662](https://github.com/DelSkayn/rquickjs/pull/662)
+- `Value::new_big_int` now returns `Result<Value>` so QuickJS allocation failures are surfaced to the caller #[585](https://github.com/DelSkayn/rquickjs/issues/585)
+
+### Added
+
+- Added `#[qjs(prop)]` method attribute to declare a JS data property on a class prototype.
+  Unlike `#[qjs(get)]`, which generates an accessor and requires a `FromJs<Self>` receiver,
+  `prop` is evaluated at class registration time and emits a plain data descriptor (matching
+  Web IDL semantics for `@@toStringTag`, `@@species`, etc.). Honours `rename`, `configurable`,
+  `enumerable`, and a new `writable` flag (which also gates `writable` on `prop`).
+- Added `FromJs` and `IntoJs` derive macros for plain-data structs
+- Added `RQUICKJS_SYS_NO_WASI_SDK` env variable that skips downloading and setting up the WASI SDK when set to `1` #[648](https://github.com/DelSkayn/rquickjs/pull/648)
+- Added `Object::new_proto` for creating objects with a custom or null prototype #[572](https://github.com/DelSkayn/rquickjs/issues/572)
+- Added `Symbol::new`, `Symbol::with_description`, and `Symbol::new_global` for creating local and global symbols from Rust #[672](https://github.com/DelSkayn/rquickjs/pull/672)
+- Added `ArrayBufferSource` trait and `ArrayBuffer::from_source` / `from_source_shared` / `from_source_immutable` safe constructors for wrapping external, caller-owned buffers, with built-in impls for `Vec<u8>`, `Box<[u8]>`, `Arc<[u8]>`, `Arc<Vec<u8>>`, and (behind the `bytes` feature) `bytes::Bytes`
+- Add pre-generated bindings for `armv7-unknown-linux-gnueabihf`
+- Add pre-generated bindings for `powerpc64-unknown-linux-gnu`
+
+### Changed
+
+- Bump MSRV to 1.87
+- Updated `AsyncContext::async_with` to use async closure syntax #[602](https://github.com/DelSkayn/rquickjs/pull/602)
+
+### Deprecated
+
+- Deprecated `async_with!` macro #[602](https://github.com/DelSkayn/rquickjs/pull/602)
+
+### Fixed
+
+- Fixed `Property::configurable()` / `.writable()` / `.enumerable()` not emitting `JS_PROP_HAS_*` flags, so redefining an existing property silently kept its old attributes #[693](https://github.com/DelSkayn/rquickjs/issues/693)
+- Fixed QuickJS rope strings (`JS_TAG_STRING_ROPE`) not being recognized as strings, causing `type_of()`, `is_string()`, and `as_string()` to fail on large concatenated strings
+- Fixed interrupt handler causing GC assertion failure due to missing `JS_DupContext` on error context from `JS_ExecutePendingJob` #[664](https://github.com/DelSkayn/rquickjs/pull/664)
+- Fixed cross-thread stack overflow false positives in parallel mode by updating stack baseline before QuickJS C entry points
+- Fixed promise polling not returning Ready variant when exception occurs
+- Fixed promise future aborting on stale pending exceptions by only bailing on uncatchable errors (e.g. interrupt handler)
+- Fixed iterators to use correct IteratorPrototype chain
+- Fixed a latent ABI layout vulnerability in `JS_NewPromiseCapability` FFI boundary by replacing tuple with strictly compatible array
+- `#[rquickjs::class]` now rejects fields whose type implements `JsClass` with a clear compile error; such fields silently dropped nested mutations because the generated getter cloned the value. Wrap the field in `Class<'js, T>` instead #[532](https://github.com/DelSkayn/rquickjs/issues/532)
+- Added missing `Trace` implementations for `Constructor`, `Promise`, `Proxy`, `ArrayBuffer`, and `TypedArray`; added `JsLifetime` for `Proxy`; re-exported `Constructor` at the crate root
+- Fixed `#[qjs(static, rename = PredefinedAtom::...)]` methods failing when the target symbol exists as a non-writable property on `Function.prototype` (e.g. `Symbol.hasInstance`) by defining properties directly on the constructor instead of going through the prototype chain #[315](https://github.com/DelSkayn/rquickjs/issues/315)
+- Fixed `#[qjs(static, get/set)]` accessors being placed on the class prototype instead of the constructor #[478](https://github.com/DelSkayn/rquickjs/issues/478)
+- Fixed `Runtime::set_max_stack_size` crashing on large values (e.g. `usize::MAX`) by clamping to avoid a pointer underflow inside QuickJS's stack limit check #[437](https://github.com/DelSkayn/rquickjs/issues/437)
+
+## [0.11.0] - 2025-12-16
+
+### Added
+
+- Added `Proxy` object #[#570](https://github.com/DelSkayn/rquickjs/pull/570)
+- Allow setting filename as an eval option #[#536](https://github.com/DelSkayn/rquickjs/pull/536)
+- Add Iterable allow JS to iterate over Rust iterator #[#564](https://github.com/DelSkayn/rquickjs/pull/564)
+- Add JsIterator to iterate over Javascript Iterator #[#564](https://github.com/DelSkayn/rquickjs/pull/564)
+- Add more trait implementations like AsRef for CString #[#558](https://github.com/DelSkayn/rquickjs/pull/558)
+
+### Changed
+
+- Bump MSRV to 1.85 #[#531](https://github.com/DelSkayn/rquickjs/pull/531)
+- Update quickjs-ng to #[be664ca](https://github.com/quickjs-ng/quickjs/commit/be664ca1ccd86cbadf8df7348b8e15e77a32a1ba) #[#566](https://github.com/DelSkayn/rquickjs/pull/566)
+
+### Fixed
+
+- Fix wasm32 build #[548](https://github.com/DelSkayn/rquickjs/pull/548)
+
+## [0.10.0] - 2025-10-24
+
+### Added
+
+- Allow `rquickjs-core` to build with `no_std` #[#455](https://github.com/DelSkayn/rquickjs/pull/455)
+- Add `PromiseHook` bindings #[#453](https://github.com/DelSkayn/rquickjs/pull/453)
+- Add `Module::write` options to enable features like `JS_WRITE_OBJ_STRIP_SOURCE` and `JS_WRITE_OBJ_STRIP_DEBUG` #[#443](https://github.com/DelSkayn/rquickjs/pull/443) and #[#518](https://github.com/DelSkayn/rquickjs/pull/518)
+- Allow building with [sanitizer](https://doc.rust-lang.org/beta/unstable-book/compiler-flags/sanitizer.html) #[#425](https://github.com/DelSkayn/rquickjs/pull/425)
+- Add `set_host_promise_rejection_tracker` to `AsyncRuntime` #[#452](https://github.com/DelSkayn/rquickjs/pull/452)
+- Add linux arm64 support to `sys` crate #[#445](https://github.com/DelSkayn/rquickjs/pull/445)
+- Implement `Trace` for `Atom` #[#517](https://github.com/DelSkayn/rquickjs/pull/517)
+- Add `disable-assertions` feature to disable runtime assertions in quickjs #[#535](https://github.com/DelSkayn/rquickjs/pull/535)
+- Add `JS_TAG_SHORT_BIG_INT` tag to support short BigInt #[#458](https://github.com/DelSkayn/rquickjs/pull/458) and #[#519](https://github.com/DelSkayn/rquickjs/pull/519)
+
+### Changed
+
+- Bump MSRV to 1.82 #[#531](https://github.com/DelSkayn/rquickjs/pull/531)
+- Update to 2024 edition #[#473](https://github.com/DelSkayn/rquickjs/pull/473)
+- Export `DriveFuture` #[#491](https://github.com/DelSkayn/rquickjs/pull/491)
+- Switch to `dlopen2` for native module loading #[#513](https://github.com/DelSkayn/rquickjs/pull/513)
+
+### Fixed
+
+- Fix base objects intrinsic not being enabled in async context #[#442](https://github.com/DelSkayn/rquickjs/pull/442)
+- Fix namespace resolution for JsLifetime in derive macro #[#429](https://github.com/DelSkayn/rquickjs/pull/429)
+- Fix ownership of ctx pointers to be more ergonomic and fix cleanup bugs #[#433](https://github.com/DelSkayn/rquickjs/pull/433)
+- Fix rename option in qjs attribute #[#428](https://github.com/DelSkayn/rquickjs/pull/428)
+- Strip llvm suffix for `*-pc-windows-gnullvm` target #[#506](https://github.com/DelSkayn/rquickjs/pull/506)
+
+## [0.9.0] - 2025-01-29
+
+### Breaking Changes
+
+- Switching to quickjs-ng from quickjs as base engine #[369](https://github.com/DelSkayn/rquickjs/pull/369)
+
+This change should bring better performances and features, we are aware that it is bigger in intruction sizes.
+
+We would eventually like to support the "original" quickjs engine again in the future, but we use new functions now that are only available in the `-ng` version.

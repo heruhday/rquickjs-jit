@@ -1,0 +1,36 @@
+name: Stdlib
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - run: cargo test -p quickjs-jit-stdlib
+      - run: cargo test -p quickjs-jit-stdlib --all-features
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - run: python scripts/check-stdlib-jit.py
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: '1.89.0'
+      - run: cargo check -p quickjs-jit-stdlib

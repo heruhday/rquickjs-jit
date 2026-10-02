@@ -1,0 +1,2966 @@
+#![cfg_attr(rquickjs_memory_sanitizer, feature(thread_local))]
+
+//! Optional tiered JIT integration for `rquickjs`.
+//!
+//! The runtime attaches through a versioned engine ABI while execution remains
+//! on the QuickJS interpreter until compiler tiers are enabled.
+
+pub mod abi;
+pub mod bytecode;
+pub mod code_cache;
+pub mod compiler;
+mod config;
+pub mod correctness;
+mod error;
+#[cfg(feature = "compiler")]
+pub mod ir;
+mod metrics;
+pub mod platform;
+pub mod runtime;
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+#[path = "../tests/support/mod.rs"]
+pub mod test_support;
+
+use core::ops::Deref;
+#[cfg(all(feature = "compiler", not(target_family = "wasm")))]
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+pub use config::{JitConfig, JitConfigBuilder, JitDiagnostic, JitDiagnosticKind, JitTierPolicy};
+pub use error::JitError;
+pub use metrics::JitMetrics;
+pub use rquickjs_core::Runtime;
+
+const NATIVE_EXECUTION_SUPPORTED: bool = cfg!(any(
+    all(
+        target_os = "macos",
+        target_endian = "little",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(
+        target_os = "windows",
+        target_endian = "little",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(
+        target_os = "linux",
+        target_endian = "little",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+));
+
+#[cfg(all(
+    feature = "compiler",
+    any(
+        all(
+            target_os = "macos",
+            target_endian = "little",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "windows",
+            target_endian = "little",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "linux",
+            target_endian = "little",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
+))]
+fn artifact_environment(
+    runtime_id: u64,
+    info: &abi::AbiInfo,
+    config: &JitConfig,
+    compiler: &compiler::baseline::BaselineCompiler,
+) -> runtime::ArtifactEnvironment {
+    fn mix(hash: u64, value: u64) -> u64 {
+        (hash ^ value).wrapping_mul(0x100000001b3)
+    }
+    let target_identity = compiler.target_identity();
+    let mut config_fingerprint = 0xcbf29ce484222325;
+    for value in [
+        u64::from(config.call_threshold()),
+        u64::from(config.loop_threshold()),
+        config.max_code_bytes() as u64,
+        config.max_metadata_bytes() as u64,
+        config.max_snapshot_bytes() as u64,
+        config.max_ir_bytes() as u64,
+        config.compile_timeout_ms(),
+        config.max_queue_len() as u64,
+        config.workers() as u64,
+        u64::from(config.max_compile_attempts()),
+        match config.tier_policy() {
+            JitTierPolicy::Automatic => 0,
+            JitTierPolicy::BaselineOnly => 1,
+            JitTierPolicy::Optimize => 2,
+        },
+    ] {
+        config_fingerprint = mix(config_fingerprint, value);
+    }
+    runtime::ArtifactEnvironment {
+        runtime_id,
+        target_isa: target_identity.triple_fingerprint(),
+        cpu_features: target_identity.codegen_fingerprint(),
+        abi_fingerprint: mix(
+            mix(info.build_fingerprint(), info.source_revision()),
+            info.opcode_fingerprint(),
+        ),
+        config_fingerprint,
+    }
+}
+
+/// Owns the guard that keeps a JIT backend attached to a runtime.
+#[derive(Debug)]
+pub struct Jit {
+    metrics: Arc<Mutex<JitMetrics>>,
+    config: JitConfig,
+    _guard: rquickjs_core::runtime::RuntimeJitGuard,
+    #[cfg(feature = "test-support")]
+    test_environment: Arc<Mutex<Option<runtime::ArtifactEnvironment>>>,
+    #[cfg(feature = "test-support")]
+    test_last_acquired_key: Arc<Mutex<Option<code_cache::ArtifactKey>>>,
+}
+
+impl Jit {
+    /// Attaches the initial no-op backend to an existing runtime.
+    pub fn attach(runtime: &Runtime, config: JitConfig) -> Result<Self, JitError> {
+        let info = abi::AbiInfo::query_linked()?;
+        Self::attach_with_info(runtime, config, info)
+    }
+
+    fn attach_with_info(
+        runtime: &Runtime,
+        config: JitConfig,
+        info: abi::AbiInfo,
+    ) -> Result<Self, JitError> {
+        if let Err(error) = info.validate() {
+            if let abi::AbiError::Incompatible(mismatch) = error {
+                config.report(JitDiagnosticKind::AbiMismatch(mismatch));
+            }
+            return Err(error.into());
+        }
+
+        let metrics = Arc::new(Mutex::new(JitMetrics::disabled()));
+        #[cfg(all(
+            feature = "compiler",
+            any(
+                all(
+                    target_os = "macos",
+                    target_endian = "little",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(
+                    target_os = "windows",
+                    target_endian = "little",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(
+                    target_os = "linux",
+                    target_endian = "little",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                )
+            )
+        ))]
+        let backend = ProductionBackend::new(
+            runtime.jit_runtime_id(),
+            &info,
+            config.clone(),
+            Arc::clone(&metrics),
+        )?;
+        #[cfg(all(
+            feature = "test-support",
+            feature = "compiler",
+            any(
+                all(
+                    target_os = "macos",
+                    target_endian = "little",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(
+                    target_os = "windows",
+                    target_endian = "little",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(
+                    target_os = "linux",
+                    target_endian = "little",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                )
+            )
+        ))]
+        let test_environment = Arc::clone(&backend.environment);
+        #[cfg(all(
+            feature = "test-support",
+            feature = "compiler",
+            any(
+                all(
+                    target_os = "macos",
+                    target_endian = "little",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(
+                    target_os = "windows",
+                    target_endian = "little",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(
+                    target_os = "linux",
+                    target_endian = "little",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                )
+            )
+        ))]
+        let test_last_acquired_key = Arc::clone(&backend.test_last_acquired_key);
+        #[cfg(not(all(
+            feature = "compiler",
+            any(
+                all(
+                    target_os = "macos",
+                    target_endian = "little",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(
+                    target_os = "windows",
+                    target_endian = "little",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(
+                    target_os = "linux",
+                    target_endian = "little",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                )
+            )
+        )))]
+        let backend = NoopBackend {
+            _config: config.clone(),
+        };
+        let guard = match runtime.attach_jit_backend(backend) {
+            Ok(guard) => guard,
+            Err(error) => {
+                config.report(JitDiagnosticKind::BackendAttachment);
+                return Err(error.into());
+            }
+        };
+        Ok(Self {
+            metrics,
+            config,
+            _guard: guard,
+            #[cfg(feature = "test-support")]
+            test_environment: {
+                #[cfg(all(
+                    feature = "compiler",
+                    any(
+                        all(
+                            target_os = "macos",
+                            target_endian = "little",
+                            any(target_arch = "x86_64", target_arch = "aarch64")
+                        ),
+                        all(
+                            target_os = "windows",
+                            target_endian = "little",
+                            any(target_arch = "x86_64", target_arch = "aarch64")
+                        ),
+                        all(
+                            target_os = "linux",
+                            target_endian = "little",
+                            any(target_arch = "x86_64", target_arch = "aarch64")
+                        )
+                    )
+                ))]
+                {
+                    test_environment
+                }
+                #[cfg(not(all(
+                    feature = "compiler",
+                    any(
+                        all(
+                            target_os = "macos",
+                            target_endian = "little",
+                            any(target_arch = "x86_64", target_arch = "aarch64")
+                        ),
+                        all(
+                            target_os = "windows",
+                            target_endian = "little",
+                            any(target_arch = "x86_64", target_arch = "aarch64")
+                        ),
+                        all(
+                            target_os = "linux",
+                            target_endian = "little",
+                            any(target_arch = "x86_64", target_arch = "aarch64")
+                        )
+                    )
+                )))]
+                {
+                    Arc::new(Mutex::new(None))
+                }
+            },
+            #[cfg(feature = "test-support")]
+            test_last_acquired_key: {
+                #[cfg(all(
+                    feature = "compiler",
+                    any(
+                        all(
+                            target_os = "macos",
+                            target_endian = "little",
+                            any(target_arch = "x86_64", target_arch = "aarch64")
+                        ),
+                        all(
+                            target_os = "windows",
+                            target_endian = "little",
+                            any(target_arch = "x86_64", target_arch = "aarch64")
+                        ),
+                        all(
+                            target_os = "linux",
+                            target_endian = "little",
+                            any(target_arch = "x86_64", target_arch = "aarch64")
+                        )
+                    )
+                ))]
+                {
+                    test_last_acquired_key
+                }
+                #[cfg(not(all(
+                    feature = "compiler",
+                    any(
+                        all(
+                            target_os = "macos",
+                            target_endian = "little",
+                            any(target_arch = "x86_64", target_arch = "aarch64")
+                        ),
+                        all(
+                            target_os = "windows",
+                            target_endian = "little",
+                            any(target_arch = "x86_64", target_arch = "aarch64")
+                        ),
+                        all(
+                            target_os = "linux",
+                            target_endian = "little",
+                            any(target_arch = "x86_64", target_arch = "aarch64")
+                        )
+                    )
+                )))]
+                {
+                    Arc::new(Mutex::new(None))
+                }
+            },
+        })
+    }
+
+    /// Fails when the current target cannot support native execution.
+    pub fn require_native(&self) -> Result<(), JitError> {
+        if NATIVE_EXECUTION_SUPPORTED {
+            Ok(())
+        } else {
+            Err(JitError::UnsupportedPlatform)
+        }
+    }
+
+    /// Suspends hot, feedback, native-entry acquisition, and OSR probes in O(1).
+    pub fn suspend(&self) -> Result<(), JitError> {
+        self._guard.suspend().map_err(Into::into)
+    }
+
+    /// Resumes probes without tearing down the backend or installed artifacts.
+    pub fn resume(&self) -> Result<(), JitError> {
+        self._guard.resume().map_err(Into::into)
+    }
+
+    /// Returns whether this runtime's JIT probes are suspended.
+    pub fn is_suspended(&self) -> bool {
+        self._guard.is_suspended()
+    }
+
+    /// Returns the metrics associated with this backend guard.
+    pub fn metrics(&self) -> JitMetrics {
+        self.metrics
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Performs bounded installation and reclamation work on the runtime thread.
+    pub fn poll(&self) {
+        self._guard.poll();
+        let snapshot = self.metrics();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.config.observe(&snapshot);
+        }));
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn test_artifact_environment(&self) -> runtime::ArtifactEnvironment {
+        self.test_environment
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("production compiler backend has not received eligible work")
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn test_artifact_environment_initialized(&self) -> bool {
+        self.test_environment
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn test_last_acquired_artifact_key(&self) -> Option<code_cache::ArtifactKey> {
+        *self
+            .test_last_acquired_key
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[cfg(not(all(
+    feature = "compiler",
+    any(
+        all(
+            target_os = "macos",
+            target_endian = "little",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "windows",
+            target_endian = "little",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "linux",
+            target_endian = "little",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
+)))]
+#[derive(Debug)]
+struct NoopBackend {
+    _config: JitConfig,
+}
+
+#[cfg(not(all(
+    feature = "compiler",
+    any(
+        all(
+            target_os = "macos",
+            target_endian = "little",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "windows",
+            target_endian = "little",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "linux",
+            target_endian = "little",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
+)))]
+unsafe impl rquickjs_core::runtime::JitBackend for NoopBackend {}
+
+/// Upper bound on consecutive per-call ticks that may skip the full
+/// maintenance pass when no completion, feedback change, or installation
+/// happened. Backoff windows are measured in clock ticks, which still advance
+/// on every call, so this only bounds the latency of candidate scans.
+#[cfg(all(feature = "compiler", not(target_family = "wasm")))]
+const HOT_MAINTENANCE_INTERVAL: u32 = 64;
+
+/// Feedback pc used for return types observed at native `DONE` exits.
+#[cfg(all(feature = "compiler", not(target_family = "wasm")))]
+const NATIVE_RETURN_FEEDBACK_PC: u32 = u32::MAX;
+
+#[cfg(all(
+    feature = "compiler",
+    any(
+        all(
+            target_os = "macos",
+            target_endian = "little",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "windows",
+            target_endian = "little",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "linux",
+            target_endian = "little",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
+))]
+struct ProductionBackend {
+    runtime_id: u64,
+    abi_info: abi::AbiInfo,
+    environment: Arc<Mutex<Option<runtime::ArtifactEnvironment>>>,
+    config: JitConfig,
+    coordinator: runtime::Coordinator,
+    workers: runtime::BackgroundCompiler,
+    requested: std::collections::HashSet<runtime::FunctionKey>,
+    hotness: std::collections::HashMap<runtime::FunctionKey, runtime::HotnessState>,
+    optimizing_requested: std::collections::HashSet<runtime::FunctionKey>,
+    optimizing_hotness: std::collections::HashMap<runtime::FunctionKey, runtime::HotnessState>,
+    optimizing_snapshots:
+        std::collections::HashMap<runtime::FunctionKey, bytecode::VerifiedFunction>,
+    baseline_property_refreshed: std::collections::HashSet<runtime::FunctionKey>,
+    tier2_sources: std::collections::HashMap<runtime::FunctionKey, bytecode::VerifiedFunction>,
+    feedback: runtime::FeedbackTable,
+    // CALL feedback consumers finish synchronously and never reenter QuickJS.
+    call_feedback_types: Vec<runtime::ObservedType>,
+    shape_feedback: runtime::ShapeFeedbackTable,
+    metrics: Arc<Mutex<JitMetrics>>,
+    native_entries: u64,
+    native_acquisitions: u64,
+    native_exits: u64,
+    native_fallbacks: u64,
+    native_retries: u64,
+    osr_entries: u64,
+    osr_not_ready: u64,
+    osr_map_misses: u64,
+    osr_validation_failures: u64,
+    osr_attempts: u64,
+    osr_generated_retries: u64,
+    osr_validation: Arc<OsrValidationMetrics>,
+    clock: u64,
+    /// Per-call runtime callbacks (entry acquisition, hot probes, exits) run
+    /// the full maintenance pass only when it can change anything: pending
+    /// worker completions, new feedback, or a bounded number of skipped
+    /// ticks. The clock still advances on every tick.
+    hot_ticks_since_maintenance: u32,
+    generic_call_rejections: u64,
+    last_scan_feedback_version: u64,
+    last_scan_installed: u64,
+    last_refresh_scan: Option<(u64, u64)>,
+    direct_refresh_probes: std::collections::HashMap<runtime::FunctionKey, (u64, u64)>,
+    queue_reasons: std::collections::HashMap<runtime::FunctionKey, runtime::HotReason>,
+    prequeue_backoff: std::collections::HashMap<runtime::FunctionKey, (u8, u64)>,
+    hot_call_queues: u64,
+    hot_loop_queues: u64,
+    adaptive_neutral_queues: u64,
+    adaptive_inputs_recorded: u64,
+    snapshot_requests: u64,
+    stable_path_compile_requests: u64,
+    // Cached C handles can execute repeatedly without another acquisition.
+    // Replacement acquisition updates this before native_enter; active frames
+    // retain their own tier in execution_starts across recursive replacement.
+    entry_tiers: std::collections::HashMap<runtime::FunctionKey, runtime::Tier>,
+    entry_cache_epoch: u64,
+    // C brackets each native invocation with a synchronous enter/exit pair.
+    // Keep active records through retirement and preserve each invocation's tier.
+    execution_starts: Vec<(runtime::FunctionKey, std::time::Instant, runtime::Tier)>,
+    execution_profiles: std::collections::HashMap<runtime::FunctionKey, ProductionProfile>,
+    profitability_evaluations: u64,
+    profitability_approved: u64,
+    profitability_rejected: u64,
+    profitability_backoff: std::collections::HashMap<runtime::FunctionKey, (u8, u64)>,
+    /// Baseline was measured harmful and unpublished.  This is deliberately
+    /// not a terminal function blacklist: stable feedback may still justify
+    /// one of the coordinator's bounded optimizing-tier trials.
+    profitability_blacklisted: std::collections::HashSet<runtime::FunctionKey>,
+    /// Immutable generations for which neither tier can ever produce code.
+    /// `record_hot` reports these to QuickJS so it can turn off all probes and
+    /// feedback at the bytecode object, avoiding a permanent C -> Rust tax.
+    feedback_disabled: std::collections::HashSet<runtime::FunctionKey>,
+    benefit_recordings: u64,
+    measured_benefit_ns: u64,
+    compiler_measurements: Arc<CompilerMeasurements>,
+    install_ns: u64,
+    peak_compiler_bytes: usize,
+    #[cfg(feature = "test-support")]
+    test_last_acquired_key: Arc<Mutex<Option<code_cache::ArtifactKey>>>,
+}
+
+#[cfg(all(feature = "compiler", not(target_family = "wasm")))]
+#[derive(Default)]
+struct CompilerMeasurements {
+    elapsed_ns: AtomicU64,
+}
+
+#[cfg(all(feature = "compiler", not(target_family = "wasm")))]
+struct MeasuredCompiler<C> {
+    inner: C,
+    measurements: Arc<CompilerMeasurements>,
+}
+
+#[cfg(all(feature = "compiler", not(target_family = "wasm")))]
+#[derive(Default)]
+struct DeferredTieredCompiler {
+    compiler: std::sync::OnceLock<compiler::optimized::TieredCompiler>,
+}
+
+#[cfg(all(feature = "compiler", not(target_family = "wasm")))]
+impl compiler::Compiler for DeferredTieredCompiler {
+    fn compile(
+        &self,
+        request: runtime::CompileRequest,
+    ) -> Result<code_cache::CompiledArtifact, compiler::CompileFailure> {
+        self.compiler
+            .get_or_init(compiler::optimized::TieredCompiler::host)
+            .compile(request)
+    }
+}
+
+#[cfg(all(feature = "compiler", not(target_family = "wasm")))]
+impl<C: compiler::Compiler> compiler::Compiler for MeasuredCompiler<C> {
+    fn compile(
+        &self,
+        request: runtime::CompileRequest,
+    ) -> Result<code_cache::CompiledArtifact, compiler::CompileFailure> {
+        let started = std::time::Instant::now();
+        let result = self.inner.compile(request);
+        self.measurements.elapsed_ns.fetch_add(
+            started.elapsed().as_nanos().try_into().unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        result
+    }
+}
+
+#[cfg(all(feature = "compiler", not(target_family = "wasm")))]
+#[derive(Clone, Copy, Debug, Default)]
+struct ProductionProfile {
+    bytecodes: u64,
+    helper_calls: u64,
+    baseline_executions: u64,
+    baseline_ns: u64,
+    optimized_executions: u64,
+    optimized_ns: u64,
+}
+
+#[cfg(all(feature = "compiler", not(target_family = "wasm")))]
+struct ProductionEntryPin {
+    execution: code_cache::ExecutionPin,
+    native: *const u8,
+    runtime_id: u64,
+    key: runtime::FunctionKey,
+    pc: u32,
+    stack_map_count: u32,
+    osr: Option<runtime::OsrMap>,
+    validation: Arc<OsrValidationMetrics>,
+    #[cfg(feature = "test-support")]
+    stress_gc: bool,
+}
+
+#[cfg(all(feature = "compiler", not(target_family = "wasm")))]
+type PendingDeoptGuards = std::collections::HashMap<
+    (u64, u64),
+    std::collections::VecDeque<(u32, Option<runtime::ObservedType>)>,
+>;
+#[cfg(all(feature = "compiler", not(target_family = "wasm")))]
+struct PendingNativeReturn {
+    function: runtime::FunctionKey,
+    observed: runtime::ObservedType,
+}
+
+#[cfg(all(feature = "compiler", not(target_family = "wasm")))]
+#[derive(Default)]
+struct OsrValidationMetrics {
+    successes: AtomicU64,
+    failures: AtomicU64,
+    validation_retries: Mutex<std::collections::HashMap<(u64, u64, u32), u64>>,
+    deopt_guards: Mutex<PendingDeoptGuards>,
+    deopt_materializations: AtomicU64,
+    side_path_entries: AtomicU64,
+    /// The trampoline publishes after the native call has returned; C invokes
+    /// native_exit immediately afterward, before any release callback or other
+    /// JavaScript reentry. Even recursion therefore has only one pending return
+    /// per runtime. Keep this handoff inline instead of allocating a queue for
+    /// each call. The interpreter records return feedback at `OP_return`, but
+    /// a function that returns natively (including a first invocation that
+    /// entered baseline code through OSR) never executes that opcode, and a
+    /// call signature that never completes would block Tier 2 forever.
+    native_return: Mutex<Option<PendingNativeReturn>>,
+}
+
+#[cfg(all(feature = "compiler", not(target_family = "wasm")))]
+impl OsrValidationMetrics {
+    fn mark_validation_retry(&self, id: u64, generation: u64, pc: u32) {
+        let mut retries = self
+            .validation_retries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let pending = retries.entry((id, generation, pc)).or_default();
+        *pending = pending.saturating_add(1);
+    }
+
+    fn take_validation_retry(&self, id: u64, generation: u64, pc: u32) -> bool {
+        let mut retries = self
+            .validation_retries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (id, generation, pc);
+        let Some(pending) = retries.get_mut(&key) else {
+            return false;
+        };
+        *pending -= 1;
+        if *pending == 0 {
+            retries.remove(&key);
+        }
+        true
+    }
+
+    fn mark_deopt_guard(
+        &self,
+        id: u64,
+        generation: u64,
+        guard: u32,
+        observed: Option<runtime::ObservedType>,
+    ) {
+        self.deopt_guards
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry((id, generation))
+            .or_default()
+            .push_back((guard, observed));
+    }
+
+    fn take_deopt_guard(
+        &self,
+        id: u64,
+        generation: u64,
+    ) -> Option<(u32, Option<runtime::ObservedType>)> {
+        let mut guards = self
+            .deopt_guards
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let queue = guards.get_mut(&(id, generation))?;
+        let guard = queue.pop_front();
+        if queue.is_empty() {
+            guards.remove(&(id, generation));
+        }
+        guard
+    }
+
+    fn take_side_path_entries(&self) -> u64 {
+        self.side_path_entries.swap(0, Ordering::AcqRel)
+    }
+
+    fn mark_native_return(&self, id: u64, generation: u64, observed: runtime::ObservedType) {
+        let mut pending = self
+            .native_return
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert!(pending.is_none(), "native return callback was not consumed");
+        *pending = Some(PendingNativeReturn {
+            function: runtime::FunctionKey::new(id, generation),
+            observed,
+        });
+    }
+
+    fn take_native_return(&self, id: u64, generation: u64) -> Option<runtime::ObservedType> {
+        let mut pending = self
+            .native_return
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pending.as_ref()?.function != runtime::FunctionKey::new(id, generation) {
+            return None;
+        }
+        pending.take().map(|entry| entry.observed)
+    }
+}
+
+/// Feedback classification of one tagged value, shared by deoptimization
+/// and native-return observations.
+#[cfg(all(feature = "compiler", not(target_family = "wasm")))]
+fn observed_value_type(value: rquickjs_core::qjs::JSValue) -> Option<runtime::ObservedType> {
+    use rquickjs_core::qjs;
+    let tag = unsafe { qjs::JS_VALUE_GET_TAG(value) };
+    Some(match tag {
+        qjs::JS_TAG_INT => runtime::ObservedType::Int32,
+        qjs::JS_TAG_FLOAT64 => runtime::ObservedType::Float64,
+        qjs::JS_TAG_BOOL => runtime::ObservedType::Bool,
+        qjs::JS_TAG_NULL => runtime::ObservedType::Null,
+        qjs::JS_TAG_UNDEFINED => runtime::ObservedType::Undefined,
+        qjs::JS_TAG_STRING => runtime::ObservedType::String,
+        qjs::JS_TAG_OBJECT => runtime::ObservedType::Object,
+        _ => return None,
+    })
+}
+
+#[cfg(all(feature = "compiler", not(target_family = "wasm")))]
+fn record_osr_validation(metrics: &OsrValidationMetrics, pc: u32, valid: bool) {
+    if pc == 0 {
+        return;
+    }
+    if valid {
+        metrics.successes.fetch_add(1, Ordering::Relaxed);
+    } else {
+        metrics.failures.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(all(feature = "compiler", not(target_family = "wasm")))]
+const fn is_generated_osr_retry(pc: u32, exit_kind: u32, validation_retry: bool) -> bool {
+    pc != 0
+        && exit_kind == rquickjs_core::qjs::JSJitExitKind_JS_JIT_EXIT_RETRY_INTERPRETER
+        && !validation_retry
+}
+
+#[cfg(all(feature = "compiler", not(target_family = "wasm")))]
+fn apply_stress_gc_after_validation(
+    frame: &mut rquickjs_core::qjs::JSJitExecFrame,
+    stress_gc: bool,
+    valid: bool,
+) {
+    if valid && stress_gc {
+        frame.flags |= rquickjs_core::qjs::JS_JIT_FRAME_STRESS_GC;
+    }
+}
+
+#[cfg(all(feature = "compiler", not(target_family = "wasm")))]
+fn retry_exit() -> rquickjs_core::qjs::JSJitExit {
+    rquickjs_core::qjs::JSJitExit {
+        kind: rquickjs_core::qjs::JSJitExitKind_JS_JIT_EXIT_RETRY_INTERPRETER,
+        reserved: 0,
+        resume_pc: core::ptr::null(),
+        resume_stack_top: core::ptr::null_mut(),
+    }
+}
+
+#[cfg(all(feature = "compiler", not(target_family = "wasm")))]
+fn validate_production_frame(
+    frame: &rquickjs_core::qjs::JSJitExecFrame,
+    runtime_id: u64,
+    key: runtime::FunctionKey,
+    pc: u32,
+    stack_map_count: u32,
+    osr: Option<&runtime::OsrMap>,
+) -> bool {
+    use bytecode::SlotKind;
+    use rquickjs_core::qjs;
+
+    let expected_pc_address = (frame.bytecode_start as usize).checked_add(pc as usize);
+    if frame.struct_size != core::mem::size_of::<qjs::JSJitExecFrame>() as u32
+        || frame.rt.is_null()
+        || frame.ctx.is_null()
+        || frame.runtime_api.is_null()
+        || frame.runtime_id != runtime_id
+        || frame.frame_cookie == 0
+        || frame.function_id != key.id
+        || frame.generation != key.generation
+        || frame.bytecode_start.is_null()
+        || frame.pc.is_null()
+        || Some(frame.pc as usize) != expected_pc_address
+        || frame.entry.stack_map_count != stack_map_count
+        || frame.entry.helper_abi_version != qjs::QJSJIT_HELPER_ABI_VERSION
+        || frame.stack_base.is_null()
+        || frame.stack_top.is_null()
+        || frame.stack_capacity.is_null()
+        || (frame.stack_base as usize) > (frame.stack_top as usize)
+        || (frame.stack_top as usize) > (frame.stack_capacity as usize)
+    {
+        return false;
+    }
+    let Some(map) = osr else {
+        return pc == 0;
+    };
+    let value_size = core::mem::size_of::<qjs::JSValue>();
+    let expected_top = (frame.stack_base as usize)
+        .checked_add(usize::from(map.stack_depth()).saturating_mul(value_size));
+    if expected_top != Some(frame.stack_top as usize)
+        || frame.arg_buf.is_null()
+        || frame.var_buf.is_null()
+        || map.live_slots().len()
+            != usize::from(map.argument_count())
+                + usize::from(map.local_count())
+                + usize::from(map.stack_depth())
+    {
+        return false;
+    }
+    for (index, kind) in map.live_slots().iter().copied().enumerate() {
+        let value = if index < usize::from(map.argument_count()) {
+            unsafe { &*frame.arg_buf.add(index) }
+        } else if index < usize::from(map.argument_count()) + usize::from(map.local_count()) {
+            unsafe { &*frame.var_buf.add(index - usize::from(map.argument_count())) }
+        } else {
+            unsafe {
+                &*frame
+                    .stack_base
+                    .add(index - usize::from(map.argument_count()) - usize::from(map.local_count()))
+            }
+        };
+        let valid = match kind {
+            SlotKind::Tagged => true,
+            SlotKind::Int32 | SlotKind::CatchOffset => value.tag == i64::from(qjs::JS_TAG_INT),
+            SlotKind::Float64 => value.tag == i64::from(qjs::JS_TAG_FLOAT64),
+            SlotKind::Uninitialized => value.tag == i64::from(qjs::JS_TAG_UNINITIALIZED),
+        };
+        if !valid {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(all(feature = "compiler", not(target_family = "wasm")))]
+unsafe extern "C" fn production_entry_trampoline(
+    frame: *mut rquickjs_core::qjs::JSJitExecFrame,
+) -> rquickjs_core::qjs::JSJitExit {
+    use rquickjs_core::qjs;
+
+    if frame.is_null() {
+        return retry_exit();
+    }
+    let frame = unsafe { &mut *frame };
+    if frame.entry.pin.is_null() {
+        return retry_exit();
+    }
+    let pin = unsafe { &*frame.entry.pin.cast::<ProductionEntryPin>() };
+    let _keep_execution_pinned = &pin.execution;
+    let valid = validate_production_frame(
+        frame,
+        pin.runtime_id,
+        pin.key,
+        pin.pc,
+        pin.stack_map_count,
+        pin.osr.as_ref(),
+    );
+    record_osr_validation(&pin.validation, pin.pc, valid);
+    if !valid {
+        pin.validation
+            .mark_validation_retry(pin.key.id, pin.key.generation, pin.pc);
+        return retry_exit();
+    }
+    #[cfg(feature = "test-support")]
+    apply_stress_gc_after_validation(frame, pin.stress_gc, valid);
+    type NativeEntry = unsafe extern "C" fn(*mut qjs::JSJitExecFrame) -> qjs::JSJitExit;
+    let native = unsafe { core::mem::transmute::<*const u8, NativeEntry>(pin.native) };
+    let mut exit = unsafe { native(frame as *const _ as *mut _) };
+    #[cfg(rquickjs_memory_sanitizer)]
+    unsafe {
+        unsafe extern "C" {
+            fn __msan_unpoison(address: *const core::ffi::c_void, size: usize);
+        }
+        __msan_unpoison(
+            core::ptr::addr_of!(exit).cast(),
+            core::mem::size_of::<qjs::JSJitExit>(),
+        );
+        __msan_unpoison(
+            (frame as *mut qjs::JSJitExecFrame).cast(),
+            core::mem::size_of::<qjs::JSJitExecFrame>(),
+        );
+        let values_start = frame.arg_buf.cast::<u8>();
+        let values_end = frame.stack_capacity.cast::<u8>();
+        if !values_start.is_null() {
+            if let Some(values_size) = (values_end as usize).checked_sub(values_start as usize) {
+                if values_size <= 64 * 1024 * 1024 {
+                    __msan_unpoison(values_start.cast(), values_size);
+                }
+            }
+        }
+        let locals_start = frame.var_buf.cast::<u8>();
+        if !locals_start.is_null() {
+            if let Some(locals_size) = (values_end as usize).checked_sub(locals_start as usize) {
+                if locals_size <= 64 * 1024 * 1024 {
+                    __msan_unpoison(locals_start.cast(), locals_size);
+                }
+            }
+        }
+    }
+    if frame.flags & qjs::JS_JIT_FRAME_SIDE_PATH_HIT != 0 {
+        frame.flags &= !qjs::JS_JIT_FRAME_SIDE_PATH_HIT;
+        pin.validation
+            .side_path_entries
+            .fetch_add(1, Ordering::Release);
+    }
+    if exit.kind == qjs::JSJitExitKind_JS_JIT_EXIT_DONE {
+        if let Some(observed) = observed_value_type(frame.result) {
+            pin.validation
+                .mark_native_return(pin.key.id, pin.key.generation, observed);
+        }
+    }
+    if exit.kind != qjs::JSJitExitKind_JS_JIT_EXIT_DEOPT {
+        return exit;
+    }
+    let Some(guard) = exit.reserved.checked_sub(1) else {
+        return retry_exit();
+    };
+    let Some(resume_pc) = (exit.resume_pc as usize)
+        .checked_sub(frame.bytecode_start as usize)
+        .and_then(|pc| u32::try_from(pc).ok())
+    else {
+        return retry_exit();
+    };
+    // The pinned artifact outlives this entry, so its deopt table is read in
+    // place instead of being copied on every native entry.
+    let deopt_sites = pin
+        .execution
+        .artifact()
+        .optimized_metadata()
+        .map_or(&[][..], |metadata| metadata.deopt_sites());
+    let Some((shape, map)) = deopt_sites.iter().find(|(shape, map)| {
+        map.guard() == guard && map.resume_pc() == resume_pc && map.validate(*shape).is_ok()
+    }) else {
+        return retry_exit();
+    };
+    /* Narrow Tier 2 currently emits identity recipes only. Entry exits alias
+     * arguments/locals; instruction exits first synchronize their live
+     * operand stack into frame storage. Validate the complete transaction
+     * before publishing the resume state. Future non-identity recipes fail
+     * closed until they have an owning duplication implementation. */
+    if map.validate_identity_materialization(*shape).is_err() {
+        return retry_exit();
+    }
+    pin.validation
+        .deopt_materializations
+        .fetch_add(1, Ordering::Relaxed);
+    pin.validation.mark_deopt_guard(
+        pin.key.id,
+        pin.key.generation,
+        guard,
+        observed_deopt_type(frame, *shape),
+    );
+    /* The one-based identity is internal to the pinned backend artifact. C's
+     * stable ABI keeps this field reserved and receives only validated zero. */
+    exit.reserved = 0;
+    exit
+}
+
+#[cfg(all(feature = "compiler", not(target_family = "wasm")))]
+fn observed_deopt_type(
+    frame: &rquickjs_core::qjs::JSJitExecFrame,
+    shape: ir::OptimizedFrameShape,
+) -> Option<runtime::ObservedType> {
+    use rquickjs_core::qjs;
+    let values = unsafe {
+        core::slice::from_raw_parts(frame.arg_buf, usize::from(shape.arguments()))
+            .iter()
+            .chain(core::slice::from_raw_parts(
+                frame.var_buf,
+                usize::from(shape.locals()),
+            ))
+    };
+    values
+        .filter_map(|value| {
+            let tag = unsafe { qjs::JS_VALUE_GET_TAG(*value) };
+            Some(match tag {
+                qjs::JS_TAG_INT => runtime::ObservedType::Int32,
+                qjs::JS_TAG_FLOAT64 => runtime::ObservedType::Float64,
+                qjs::JS_TAG_BOOL => runtime::ObservedType::Bool,
+                qjs::JS_TAG_NULL => runtime::ObservedType::Null,
+                qjs::JS_TAG_UNDEFINED => runtime::ObservedType::Undefined,
+                qjs::JS_TAG_STRING => runtime::ObservedType::String,
+                qjs::JS_TAG_OBJECT => runtime::ObservedType::Object,
+                _ => return None,
+            })
+        })
+        .find(|observed| *observed != runtime::ObservedType::Int32)
+}
+
+#[cfg(all(test, feature = "compiler", not(target_family = "wasm")))]
+mod production_osr_validation_tests {
+    use super::*;
+    use rquickjs_core::qjs;
+
+    #[test]
+    fn native_return_handoff_preserves_identity_type_and_recursive_exit_order() {
+        let metrics = OsrValidationMetrics::default();
+        // An inner trampoline completes and its C exit callback consumes the
+        // observation before the outer native call can finish.
+        for (id, generation, observed) in [
+            (7, 3, runtime::ObservedType::Int32),
+            (7, 3, runtime::ObservedType::Float64),
+            (8, 4, runtime::ObservedType::String),
+            (7, 5, runtime::ObservedType::Object),
+            (7, 5, runtime::ObservedType::Bool),
+        ] {
+            metrics.mark_native_return(id, generation, observed);
+            assert_eq!(metrics.take_native_return(id + 1, generation), None);
+            assert_eq!(metrics.take_native_return(id, generation + 1), None);
+            assert_eq!(metrics.take_native_return(id, generation), Some(observed));
+            assert_eq!(metrics.take_native_return(id, generation), None);
+        }
+    }
+
+    fn bytes(frame: &qjs::JSJitExecFrame) -> Vec<u8> {
+        unsafe {
+            core::slice::from_raw_parts(
+                (frame as *const qjs::JSJitExecFrame).cast::<u8>(),
+                core::mem::size_of::<qjs::JSJitExecFrame>(),
+            )
+            .to_vec()
+        }
+    }
+
+    #[test]
+    fn every_invalid_osr_field_retries_without_mutating_the_frame() {
+        let mut bytecode = [0_u8; 8];
+        let mut stack = [unsafe { core::mem::zeroed::<qjs::JSValue>() }; 2];
+        stack[0].tag = i64::from(qjs::JS_TAG_INT);
+        let dangling_value = core::ptr::NonNull::<qjs::JSValue>::dangling().as_ptr();
+        let key = runtime::FunctionKey::new(7, 3);
+        let map = runtime::OsrMap::new(
+            runtime::OsrKey::new(key, 4),
+            4,
+            1,
+            vec![bytecode::SlotKind::Int32],
+        );
+        let mut frame: qjs::JSJitExecFrame = unsafe { core::mem::zeroed() };
+        frame.struct_size = core::mem::size_of::<qjs::JSJitExecFrame>() as u32;
+        frame.rt = core::ptr::NonNull::dangling().as_ptr();
+        frame.ctx = core::ptr::NonNull::dangling().as_ptr();
+        frame.function_id = key.id;
+        frame.generation = key.generation;
+        frame.arg_buf = dangling_value;
+        frame.var_buf = dangling_value;
+        frame.stack_base = stack.as_mut_ptr();
+        frame.stack_top = unsafe { stack.as_mut_ptr().add(1) };
+        frame.stack_capacity = unsafe { stack.as_mut_ptr().add(2) };
+        frame.bytecode_start = bytecode.as_mut_ptr();
+        frame.pc = unsafe { bytecode.as_mut_ptr().add(4) };
+        frame.runtime_api = core::ptr::NonNull::dangling().as_ptr();
+        frame.runtime_id = 11;
+        frame.frame_cookie = 9;
+        frame.entry.stack_map_count = 5;
+        frame.entry.helper_abi_version = qjs::QJSJIT_HELPER_ABI_VERSION;
+        assert!(validate_production_frame(&frame, 11, key, 4, 5, Some(&map)));
+
+        let mut invalid = Vec::new();
+        let mut value = frame;
+        value.runtime_id = 12;
+        invalid.push(value);
+        let mut value = frame;
+        value.function_id = 8;
+        invalid.push(value);
+        let mut value = frame;
+        value.generation = 4;
+        invalid.push(value);
+        let mut value = frame;
+        value.pc = bytecode.as_mut_ptr();
+        invalid.push(value);
+        let mut value = frame;
+        value.frame_cookie = 0;
+        invalid.push(value);
+        let mut value = frame;
+        value.entry.stack_map_count = 4;
+        invalid.push(value);
+        let mut value = frame;
+        value.entry.helper_abi_version = 0;
+        invalid.push(value);
+        let mut value = frame;
+        value.stack_top = value.stack_base;
+        invalid.push(value);
+
+        for candidate in &invalid {
+            let before = bytes(candidate);
+            assert!(!validate_production_frame(
+                candidate,
+                11,
+                key,
+                4,
+                5,
+                Some(&map)
+            ));
+            assert_eq!(bytes(candidate), before);
+        }
+        let before = bytes(&frame);
+        stack[0].tag = i64::from(qjs::JS_TAG_UNDEFINED);
+        let tag_before = stack[0].tag;
+        assert!(!validate_production_frame(
+            &frame,
+            11,
+            key,
+            4,
+            5,
+            Some(&map)
+        ));
+        assert_eq!(
+            bytes(&frame),
+            before,
+            "slot rejection does not mutate frame pointers"
+        );
+        assert_eq!(stack[0].tag, tag_before, "slot owner/refcount is untouched");
+    }
+
+    #[test]
+    fn osr_success_is_counted_only_after_frame_validation() {
+        let metrics = OsrValidationMetrics::default();
+        record_osr_validation(&metrics, 9, false);
+        assert_eq!(metrics.successes.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.failures.load(Ordering::Relaxed), 1);
+        assert!(is_generated_osr_retry(
+            9,
+            qjs::JSJitExitKind_JS_JIT_EXIT_RETRY_INTERPRETER,
+            false,
+        ));
+        assert!(!is_generated_osr_retry(
+            0,
+            qjs::JSJitExitKind_JS_JIT_EXIT_RETRY_INTERPRETER,
+            false,
+        ));
+        assert!(!is_generated_osr_retry(
+            9,
+            qjs::JSJitExitKind_JS_JIT_EXIT_DONE,
+            false,
+        ));
+        assert!(!is_generated_osr_retry(
+            9,
+            qjs::JSJitExitKind_JS_JIT_EXIT_RETRY_INTERPRETER,
+            true,
+        ));
+        record_osr_validation(&metrics, 9, true);
+        assert_eq!(metrics.successes.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.failures.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn invalid_stress_frame_is_byte_identical_and_does_not_arm_stress_gc() {
+        let mut frame: qjs::JSJitExecFrame = unsafe { core::mem::zeroed() };
+        let before = bytes(&frame);
+        apply_stress_gc_after_validation(&mut frame, true, false);
+        assert_eq!(bytes(&frame), before);
+    }
+
+    #[test]
+    fn validation_retry_is_not_attributed_to_generated_native_code() {
+        let metrics = OsrValidationMetrics::default();
+        metrics.mark_validation_retry(7, 3, 9);
+        assert!(metrics.take_validation_retry(7, 3, 9));
+        assert!(!metrics.take_validation_retry(7, 3, 9));
+        assert!(!metrics.take_validation_retry(7, 3, 10));
+    }
+}
+
+#[cfg(all(
+    feature = "compiler",
+    any(
+        all(
+            target_os = "macos",
+            target_endian = "little",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "windows",
+            target_endian = "little",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "linux",
+            target_endian = "little",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
+))]
+impl ProductionBackend {
+    fn new(
+        runtime_id: u64,
+        info: &abi::AbiInfo,
+        config: JitConfig,
+        metrics: Arc<Mutex<JitMetrics>>,
+    ) -> Result<Self, JitError> {
+        let environment = Arc::new(Mutex::new(None));
+        let compiler_measurements = Arc::new(CompilerMeasurements::default());
+        let compiler = Arc::new(MeasuredCompiler {
+            inner: DeferredTieredCompiler::default(),
+            measurements: Arc::clone(&compiler_measurements),
+        });
+        let workers = runtime::BackgroundCompiler::new_with_resource_limits(
+            compiler,
+            config.workers(),
+            config.max_queue_len(),
+            std::time::Duration::from_millis(config.compile_timeout_ms()),
+            config.max_snapshot_bytes(),
+            config.max_ir_bytes(),
+        )
+        .map_err(|_| JitError::InvalidConfig("workers"))?;
+        let mut coordinator = runtime::Coordinator::with_environment_and_metadata_limit(
+            config.max_queue_len(),
+            config.max_queue_len(),
+            config.max_compile_attempts(),
+            config.max_code_bytes(),
+            config.max_metadata_bytes(),
+            runtime::ArtifactEnvironment {
+                runtime_id,
+                ..runtime::ArtifactEnvironment::default()
+            },
+        );
+        coordinator.set_native_enabled(NATIVE_EXECUTION_SUPPORTED);
+        let feedback_capacity = config.max_queue_len().max(32);
+        Ok(Self {
+            runtime_id,
+            abi_info: *info,
+            environment,
+            coordinator,
+            config,
+            workers,
+            requested: std::collections::HashSet::new(),
+            hotness: std::collections::HashMap::new(),
+            optimizing_requested: std::collections::HashSet::new(),
+            optimizing_hotness: std::collections::HashMap::new(),
+            optimizing_snapshots: std::collections::HashMap::new(),
+            baseline_property_refreshed: std::collections::HashSet::new(),
+            tier2_sources: std::collections::HashMap::new(),
+            feedback: runtime::FeedbackTable::new(feedback_capacity, 3),
+            call_feedback_types: Vec::new(),
+            shape_feedback: runtime::ShapeFeedbackTable::new(3),
+            metrics,
+            native_entries: 0,
+            native_acquisitions: 0,
+            native_exits: 0,
+            native_fallbacks: 0,
+            native_retries: 0,
+            osr_entries: 0,
+            osr_not_ready: 0,
+            osr_map_misses: 0,
+            osr_validation_failures: 0,
+            osr_attempts: 0,
+            osr_generated_retries: 0,
+            osr_validation: Arc::new(OsrValidationMetrics::default()),
+            clock: 0,
+            hot_ticks_since_maintenance: 0,
+            generic_call_rejections: 0,
+            last_scan_feedback_version: u64::MAX,
+            last_scan_installed: u64::MAX,
+            last_refresh_scan: None,
+            direct_refresh_probes: std::collections::HashMap::new(),
+            queue_reasons: std::collections::HashMap::new(),
+            prequeue_backoff: std::collections::HashMap::new(),
+            hot_call_queues: 0,
+            hot_loop_queues: 0,
+            adaptive_neutral_queues: 0,
+            adaptive_inputs_recorded: 0,
+            snapshot_requests: 0,
+            stable_path_compile_requests: 0,
+            execution_starts: Vec::new(),
+            entry_tiers: std::collections::HashMap::new(),
+            entry_cache_epoch: 1,
+            execution_profiles: std::collections::HashMap::new(),
+            profitability_evaluations: 0,
+            profitability_approved: 0,
+            profitability_rejected: 0,
+            profitability_backoff: std::collections::HashMap::new(),
+            profitability_blacklisted: std::collections::HashSet::new(),
+            feedback_disabled: std::collections::HashSet::new(),
+            benefit_recordings: 0,
+            measured_benefit_ns: 0,
+            compiler_measurements,
+            install_ns: 0,
+            peak_compiler_bytes: 0,
+            #[cfg(feature = "test-support")]
+            test_last_acquired_key: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    fn ensure_artifact_environment(&mut self) {
+        if self
+            .environment
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+        {
+            return;
+        }
+        let identity_compiler = compiler::baseline::BaselineCompiler::host();
+        let environment = artifact_environment(
+            self.runtime_id,
+            &self.abi_info,
+            &self.config,
+            &identity_compiler,
+        );
+        self.coordinator.initialize_environment(environment);
+        *self
+            .environment
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(environment);
+    }
+
+    /// Runs on the per-call native path. Skips the full maintenance pass
+    /// while nothing that feeds it has changed, so a steady-state native call
+    /// pays only a clock tick instead of completion draining, candidate scans
+    /// and feedback snapshots on every entry.
+    fn maintenance_if_due(&mut self, publish_metrics: bool) {
+        self.hot_ticks_since_maintenance = self.hot_ticks_since_maintenance.saturating_add(1);
+        let due = self.hot_ticks_since_maintenance >= HOT_MAINTENANCE_INTERVAL
+            || self.coordinator.has_pending_work()
+            || self.feedback.version() != self.last_scan_feedback_version
+            || self.coordinator.installed_count() != self.last_scan_installed;
+        if due {
+            self.maintenance();
+        } else {
+            self.clock = self.clock.saturating_add(1);
+            self.coordinator.advance_clock(self.clock);
+            if publish_metrics {
+                self.publish_metrics();
+            }
+        }
+    }
+
+    fn invalidate_entry_cache(&mut self) {
+        // Epoch zero permanently disables caching after exhaustion: never let
+        // an old handle become admissible again through wraparound.
+        if self.entry_cache_epoch != 0 {
+            self.entry_cache_epoch = self.entry_cache_epoch.checked_add(1).unwrap_or(0);
+        }
+    }
+
+    fn maintenance(&mut self) {
+        // Maintenance owns installation, demotion, feedback-epoch updates,
+        // and reclamation. Invalidate before touching any of those states.
+        self.invalidate_entry_cache();
+        self.hot_ticks_since_maintenance = 0;
+        self.last_scan_feedback_version = self.feedback.version();
+        self.clock = self.clock.saturating_add(1);
+        self.coordinator.advance_clock(self.clock);
+        let installed_before = self.coordinator.metrics().installed;
+        let install_started = std::time::Instant::now();
+        self.coordinator.drain_completions();
+        if self.coordinator.metrics().installed > installed_before {
+            self.install_ns = self.install_ns.saturating_add(
+                install_started
+                    .elapsed()
+                    .as_nanos()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            );
+        }
+        let refresh_inputs = (self.feedback.version(), self.coordinator.installed_count());
+        let refresh_scan_due = self.config.tier_policy() == JitTierPolicy::BaselineOnly
+            && self.last_refresh_scan != Some(refresh_inputs);
+        if refresh_scan_due {
+            self.last_refresh_scan = Some(refresh_inputs);
+            let refreshes = self
+                .optimizing_snapshots
+                .iter()
+                .filter_map(|(key, snapshot)| {
+                    let feedback = self
+                        .feedback
+                        .snapshot(self.clock.max(1))
+                        .with_properties(self.shape_feedback.snapshot(*key));
+                    let call_ready = self
+                        .coordinator
+                        .baseline_direct_refresh_ready(*key, &feedback);
+                    let property_ready = !self.baseline_property_refreshed.contains(key)
+                        && compiler::baseline::has_baseline_property_sites(snapshot, &feedback)
+                        && matches!(
+                            self.coordinator.tier_state(*key, runtime::Tier::Baseline),
+                            runtime::CompileState::Installed(_)
+                        );
+                    (call_ready || property_ready)
+                        .then(|| (*key, snapshot.clone(), feedback, property_ready))
+                })
+                .collect::<Vec<_>>();
+            for (key, snapshot, feedback, property_ready) in refreshes {
+                if self.coordinator.prepare_baseline_direct_refresh(key)
+                    && self
+                        .coordinator
+                        .queue_with_feedback(key, runtime::Tier::Baseline, snapshot, feedback)
+                        .is_ok()
+                    && property_ready
+                {
+                    self.baseline_property_refreshed.insert(key);
+                }
+            }
+        }
+        let ready_for_tier2 = self
+            .optimizing_snapshots
+            .keys()
+            .copied()
+            .filter(|key| {
+                if self.feedback_disabled.contains(key) {
+                    return false;
+                }
+                if self
+                    .profitability_backoff
+                    .get(key)
+                    .is_some_and(|(_, retry_at)| self.clock < *retry_at)
+                {
+                    return false;
+                }
+                (matches!(
+                    self.coordinator.tier_state(*key, runtime::Tier::Baseline),
+                    runtime::CompileState::Installed(_)
+                ) || self.profitability_blacklisted.contains(key))
+                    && match self.coordinator.tier_state(*key, runtime::Tier::Optimizing) {
+                        runtime::CompileState::Cold => true,
+                        runtime::CompileState::Backoff { retry_after, .. } => {
+                            self.clock >= retry_after
+                        }
+                        _ => false,
+                    }
+            })
+            .collect::<Vec<_>>();
+        self.last_scan_installed = self.coordinator.installed_count();
+        for key in if self.config.tier_policy() == JitTierPolicy::BaselineOnly {
+            Vec::new()
+        } else {
+            ready_for_tier2
+        } {
+            let Some(snapshot) = self.optimizing_snapshots.get(&key) else {
+                continue;
+            };
+            let observed = self
+                .feedback
+                .snapshot(self.clock.max(1))
+                .with_properties(self.shape_feedback.snapshot(key));
+            let mut direct_call_candidate = false;
+            let direct_call_pending = snapshot.instructions().iter().any(|instruction| {
+                let Some(call) = observed.call_specialization_at(key, instruction.pc()) else {
+                    return false;
+                };
+                if call.callee() == key {
+                    return false;
+                }
+                let repeated_in_loop = snapshot.instructions().iter().any(|branch| {
+                    branch.pc() > instruction.pc()
+                        && branch.branch_target().is_some_and(|target| {
+                            u32::try_from(target).ok().is_some_and(|target| {
+                                target <= instruction.pc()
+                                    && snapshot.control_flow_graph().is_loop_header(target)
+                            })
+                        })
+                });
+                if !repeated_in_loop {
+                    return false;
+                }
+                direct_call_candidate = true;
+                !self.coordinator.direct_call_ready(&call)
+            });
+            /* A caller queued while its monomorphic callee is still compiling
+             * permanently lowers the site through the generic CALL bridge.
+             * Keep the caller at its installed baseline until the callee's
+             * scalar entry is publishable, then capture that pinned target in
+             * the first Tier2 artifact. Self-recursive and non-specializable
+             * calls keep their existing generic lowering. */
+            if direct_call_pending {
+                continue;
+            }
+            /* A native-to-native call through the generic CALL bridge still
+             * costs about ten interpreter calls (entry acquisition, hot
+             * probing, timing and exit accounting run as callbacks per call).
+             * A loop amortizes that against unboxed work; a function that
+             * only calls (recursion, forwarding wrappers, tail calls) cannot,
+             * and the cost model has no interpreter timing to notice that
+             * both native tiers lose. Keep such functions in the interpreter
+             * until the bridge is cached on the C side. */
+            let has_loop = snapshot.control_flow_graph().blocks().iter().any(|block| {
+                snapshot
+                    .control_flow_graph()
+                    .is_loop_header(block.start_pc())
+            });
+            let generic_call_without_loop = !has_loop
+                && snapshot.instructions().iter().any(|instruction| {
+                    matches!(
+                        instruction.opcode().name(),
+                        "call"
+                            | "call0"
+                            | "call1"
+                            | "call2"
+                            | "call3"
+                            | "call_method"
+                            | "tail_call"
+                            | "tail_call_method"
+                            | "call_constructor"
+                    ) && !observed
+                        .call_specialization_at(key, instruction.pc())
+                        .is_some_and(|call| {
+                            call.callee() != key && self.coordinator.direct_call_ready(&call)
+                        })
+                });
+            #[cfg(feature = "test-support")]
+            let forced_call_only = self.config.force_optimized();
+            #[cfg(not(feature = "test-support"))]
+            let forced_call_only = false;
+            if generic_call_without_loop && !forced_call_only {
+                self.generic_call_rejections = self.generic_call_rejections.saturating_add(1);
+                self.optimizing_snapshots.remove(&key);
+                self.feedback_disabled.insert(key);
+                if !self.profitability_blacklisted.contains(&key) {
+                    self.profitability_blacklisted.insert(key);
+                    self.coordinator.demote_baseline_to_interpreter(key);
+                }
+                continue;
+            }
+            let numeric_candidate = snapshot.instructions().iter().any(|instruction| {
+                matches!(instruction.opcode().name(), "add" | "sub" | "mul" | "div")
+            }) && !snapshot.instructions().iter().any(|instruction| {
+                matches!(
+                    instruction.opcode().name(),
+                    "call" | "tail_call" | "call_method" | "get_field" | "put_field"
+                )
+            });
+            /* A value-site observation can arrive at the loop hot probe before
+             * the same invocation emits its CALL/RETURN feedback. Compiling at
+             * that point freezes an `Any` numeric version and guarantees a
+             * generic Float64 loop even when the completed invocation proves a
+             * bounded Int32 signature. Keep the immutable bytecode snapshot,
+             * but do not queue Tier2 until the signature is complete. A truly
+             * feedback-free force-optimized test still uses its deterministic
+             * fallback below; call/property candidates have their own bounded
+             * identities and are not gated here. */
+            if numeric_candidate
+                && (observed.call_at(key).is_some() || observed.has_stable_value_for(key))
+                && observed.bounded_specialization(key).is_none()
+            {
+                continue;
+            }
+            #[cfg(feature = "test-support")]
+            let forced = self.config.force_optimized();
+            #[cfg(not(feature = "test-support"))]
+            let forced = false;
+            /* A rejected baseline does not predict Tier2 profitability: the
+             * baseline can lose to dispatch/callback overhead while a stable
+             * unboxed loop wins by orders of magnitude.  Give such a function
+             * one bounded optimizing trial; coordinator attempt/version caps
+             * still prevent compile or deopt loops. */
+            /* Baseline measurements cannot price the compiled-to-compiled
+             * transition: before the callee is publishable they include the
+             * generic CALL bridge that Tier2 removes. Once every stable
+             * direct target is ready, admit the caller's existing bounded
+             * optimizing trial without spending five misleading baseline
+             * profitability retries. */
+            if !forced && !direct_call_candidate && !self.profitability_blacklisted.contains(&key) {
+                let measured = self
+                    .execution_profiles
+                    .get(&key)
+                    .copied()
+                    .unwrap_or_default();
+                let installed = self.coordinator.metrics().installed.max(1);
+                let profile = runtime::Profile {
+                    bytecodes: measured.bytecodes,
+                    helper_calls: measured.helper_calls,
+                    compile_ns: self
+                        .compiler_measurements
+                        .elapsed_ns
+                        .load(Ordering::Relaxed)
+                        / installed,
+                    install_ns: self.install_ns / installed,
+                    executions: measured.baseline_executions,
+                    baseline_ns: measured.baseline_ns,
+                    code_bytes: measured.bytecodes.saturating_mul(8),
+                    ..runtime::Profile::default()
+                };
+                self.profitability_evaluations = self.profitability_evaluations.saturating_add(1);
+                if runtime::Profitability::default()
+                    .evaluate_trial(profile)
+                    .tier
+                    != runtime::Decision::Optimize
+                {
+                    self.profitability_rejected = self.profitability_rejected.saturating_add(1);
+                    let entry = self
+                        .profitability_backoff
+                        .entry(key)
+                        .or_insert((0, self.clock));
+                    entry.0 = entry.0.saturating_add(1);
+                    if entry.0 >= 5 {
+                        self.profitability_blacklisted.insert(key);
+                        self.coordinator.demote_baseline_to_interpreter(key);
+                    } else {
+                        entry.1 = self.clock.saturating_add(1u64 << entry.0.min(20));
+                    }
+                    continue;
+                }
+                self.profitability_backoff.remove(&key);
+                self.profitability_approved = self.profitability_approved.saturating_add(1);
+            }
+            if let Some(snapshot) = self.optimizing_snapshots.remove(&key) {
+                #[cfg(feature = "test-support")]
+                let feedback = if self.config.force_optimized() {
+                    let has_stable_call = snapshot.instructions().iter().any(|instruction| {
+                        observed
+                            .call_specialization_at(key, instruction.pc())
+                            .is_some()
+                    });
+                    let has_property = snapshot
+                        .instructions()
+                        .iter()
+                        .any(|i| observed.property_at(i.pc()).is_some());
+                    if observed.bounded_specialization(key).is_some()
+                        || has_stable_call
+                        || has_property
+                    {
+                        observed
+                    } else {
+                        let mut deterministic = runtime::FeedbackTable::new(1, 1);
+                        deterministic.observe_type(
+                            key,
+                            0,
+                            runtime::FeedbackKind::Value,
+                            runtime::ObservedType::Int32,
+                        );
+                        deterministic.snapshot(self.clock.max(1))
+                    }
+                } else {
+                    self.feedback
+                        .snapshot(self.clock)
+                        .with_properties(self.shape_feedback.snapshot(key))
+                };
+                #[cfg(not(feature = "test-support"))]
+                let feedback = self
+                    .feedback
+                    .snapshot(self.clock)
+                    .with_properties(self.shape_feedback.snapshot(key));
+                if self
+                    .coordinator
+                    .queue_with_feedback(key, runtime::Tier::Optimizing, snapshot.clone(), feedback)
+                    .is_err()
+                {
+                    self.optimizing_snapshots.insert(key, snapshot);
+                } else {
+                    self.tier2_sources.insert(key, snapshot);
+                }
+            }
+        }
+        self.workers.drain_overflow(
+            &mut self.coordinator,
+            runtime::DEFAULT_COMPLETION_DRAIN_BUDGET,
+        );
+        while matches!(self.workers.dispatch_next(&mut self.coordinator), Ok(true)) {}
+        let (jobs, snapshots, ir) = self.workers.live_usage();
+        self.peak_compiler_bytes = self
+            .peak_compiler_bytes
+            .max(self.workers.peak_compiler_bytes());
+        self.coordinator.set_worker_usage(jobs, snapshots, ir);
+        let requested = self.requested.iter().copied().collect::<Vec<_>>();
+        for key in requested {
+            let retryable = match self.coordinator.tier_state(key, runtime::Tier::Baseline) {
+                runtime::CompileState::Cold | runtime::CompileState::Retired => true,
+                runtime::CompileState::Backoff { retry_after, .. } => self.clock >= retry_after,
+                _ => false,
+            };
+            if retryable {
+                self.clear_failed_request(key);
+            }
+        }
+        self.publish_metrics();
+    }
+
+    /// Copies the backend's counters into the externally visible metrics
+    /// snapshot. Cheap enough to run on every native exit so `Jit::metrics`
+    /// stays exact even when the full maintenance pass is skipped.
+    fn publish_metrics(&mut self) {
+        let mut snapshot = self.coordinator.metrics();
+        snapshot.native_entries = self.native_entries;
+        snapshot.native_acquisitions = self.native_acquisitions;
+        snapshot.native_exits = self.native_exits;
+        snapshot.native_fallbacks = self.native_fallbacks;
+        snapshot.native_retries = self.native_retries;
+        self.osr_entries = self.osr_validation.successes.load(Ordering::Relaxed);
+        self.osr_validation_failures = self.osr_validation.failures.load(Ordering::Relaxed);
+        snapshot.osr_entries = self.osr_entries;
+        snapshot.osr_attempts = self.osr_attempts;
+        snapshot.osr_validated_successes = self.osr_validation.successes.load(Ordering::Relaxed);
+        snapshot.osr_generated_retries = self.osr_generated_retries;
+        snapshot.hot_call_queues = self.hot_call_queues;
+        snapshot.hot_loop_queues = self.hot_loop_queues;
+        snapshot.adaptive_neutral_queues = self.adaptive_neutral_queues;
+        snapshot.adaptive_inputs_recorded = self.adaptive_inputs_recorded;
+        snapshot.adaptive_size_factor_disabled = self.adaptive_inputs_recorded;
+        snapshot.snapshot_requests = self.snapshot_requests;
+        snapshot.stable_path_compile_requests = self.stable_path_compile_requests;
+        snapshot.generic_call_rejections = self.generic_call_rejections;
+        snapshot.profitability_evaluations = self.profitability_evaluations;
+        snapshot.profitability_approved = self.profitability_approved;
+        snapshot.profitability_rejected = self.profitability_rejected;
+        snapshot.benefit_recordings = self.benefit_recordings;
+        snapshot.measured_benefit_ns = self.measured_benefit_ns;
+        snapshot.compile_ns = self
+            .compiler_measurements
+            .elapsed_ns
+            .load(Ordering::Relaxed);
+        snapshot.install_ns = self.install_ns;
+        snapshot.peak_compiler_bytes = self.peak_compiler_bytes;
+        snapshot.osr_not_ready = self.osr_not_ready;
+        snapshot.osr_map_misses = self.osr_map_misses;
+        snapshot.osr_validation_failures = self.osr_validation_failures;
+        snapshot.deopt_materializations = self
+            .osr_validation
+            .deopt_materializations
+            .load(Ordering::Relaxed);
+        *self.metrics.lock().unwrap_or_else(|p| p.into_inner()) = snapshot;
+    }
+
+    fn clear_failed_request(&mut self, key: runtime::FunctionKey) {
+        self.requested.remove(&key);
+        self.queue_reasons.remove(&key);
+        if let Some(hotness) = self.hotness.get_mut(&key) {
+            hotness.clear_queued();
+        }
+    }
+
+    fn fail_before_queue(&mut self, key: runtime::FunctionKey) {
+        let attempts = self
+            .prequeue_backoff
+            .get(&key)
+            .map_or(1, |(attempts, _)| attempts.saturating_add(1));
+        let delay = 1_u64 << u32::from(attempts.min(16));
+        self.prequeue_backoff
+            .insert(key, (attempts, self.clock.saturating_add(delay)));
+        self.clear_failed_request(key);
+    }
+}
+
+#[cfg(all(
+    feature = "compiler",
+    any(
+        all(
+            target_os = "macos",
+            target_endian = "little",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "windows",
+            target_endian = "little",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "linux",
+            target_endian = "little",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
+))]
+unsafe impl rquickjs_core::runtime::JitBackend for ProductionBackend {
+    fn poll(&mut self) {
+        self.maintenance();
+    }
+
+    fn record_hot(&mut self, event: &rquickjs_core::qjs::JSJitHotEvent) -> u32 {
+        if event.count == 0 {
+            return 0;
+        }
+        let key = runtime::FunctionKey::new(event.function.id, event.function.generation);
+        /* Bit 1 is an append-only response flag understood by the patched
+         * interpreter: this immutable bytecode generation will never acquire
+         * code, so stop hot and feedback probes locally in C. */
+        if self.feedback_disabled.contains(&key) || self.coordinator.is_terminally_blacklisted(key)
+        {
+            self.feedback_disabled.insert(key);
+            return 2;
+        }
+        self.maintenance_if_due(false);
+        // Maintenance may publish code. Feedback below cannot change this state;
+        // a successful direct refresh returns before the cached value is reused.
+        let baseline_state = self.coordinator.tier_state(key, runtime::Tier::Baseline);
+        let observed = match event.feedback_type {
+            rquickjs_core::qjs::JSJitFeedbackType_JS_JIT_FEEDBACK_INT32 => {
+                Some(runtime::ObservedType::Int32)
+            }
+            rquickjs_core::qjs::JSJitFeedbackType_JS_JIT_FEEDBACK_FLOAT64 => {
+                Some(runtime::ObservedType::Float64)
+            }
+            rquickjs_core::qjs::JSJitFeedbackType_JS_JIT_FEEDBACK_BOOL => {
+                Some(runtime::ObservedType::Bool)
+            }
+            rquickjs_core::qjs::JSJitFeedbackType_JS_JIT_FEEDBACK_NULL => {
+                Some(runtime::ObservedType::Null)
+            }
+            rquickjs_core::qjs::JSJitFeedbackType_JS_JIT_FEEDBACK_UNDEFINED => {
+                Some(runtime::ObservedType::Undefined)
+            }
+            rquickjs_core::qjs::JSJitFeedbackType_JS_JIT_FEEDBACK_STRING => {
+                Some(runtime::ObservedType::String)
+            }
+            rquickjs_core::qjs::JSJitFeedbackType_JS_JIT_FEEDBACK_OBJECT => {
+                Some(runtime::ObservedType::Object)
+            }
+            _ => None,
+        };
+        if event.feedback_slot != u32::MAX {
+            if let Some(observed) = observed {
+                self.feedback
+                    .observe_type(key, event.pc, runtime::FeedbackKind::Value, observed);
+            }
+        }
+        if event.callee.id != 0 {
+            self.feedback.observe_type(
+                key,
+                event.pc,
+                runtime::FeedbackKind::CallTarget,
+                runtime::ObservedType::Function(runtime::FunctionKey::new(
+                    event.callee.id,
+                    event.callee.generation,
+                )),
+            );
+        }
+        let probe_inputs = (self.feedback.version(), self.coordinator.installed_count());
+        if self.config.tier_policy() == JitTierPolicy::BaselineOnly
+            && matches!(baseline_state, runtime::CompileState::Installed(_))
+            && self.direct_refresh_probes.get(&key) != Some(&probe_inputs)
+        {
+            // The readiness answer depends only on the feedback lattice and
+            // the installed artifact set; re-probe when either changed.
+            self.direct_refresh_probes.insert(key, probe_inputs);
+            let feedback = self.feedback.snapshot(self.clock);
+            if self
+                .coordinator
+                .baseline_direct_refresh_ready(key, &feedback)
+                && self.coordinator.prepare_baseline_direct_refresh(key)
+            {
+                self.invalidate_entry_cache();
+                self.requested.insert(key);
+                self.queue_reasons
+                    .insert(key, runtime::HotReason::CallThreshold);
+                self.snapshot_requests = self.snapshot_requests.saturating_add(1);
+                return 1;
+            }
+        }
+        if matches!(baseline_state, runtime::CompileState::Installed(_))
+            || self.profitability_blacklisted.contains(&key)
+        {
+            let optimizing_ready = match self.coordinator.tier_state(key, runtime::Tier::Optimizing)
+            {
+                runtime::CompileState::Cold => true,
+                runtime::CompileState::Backoff { retry_after, .. } => self.clock >= retry_after,
+                _ => false,
+            };
+            if !optimizing_ready
+                || self.optimizing_requested.contains(&key)
+                || self.optimizing_snapshots.contains_key(&key)
+            {
+                return 0;
+            }
+            let thresholds = runtime::HotThresholds {
+                calls: self.config.call_threshold(),
+                loops: self.config.loop_threshold(),
+                rationale: runtime::HotReason::NeutralBase,
+            };
+            let hotness = self.optimizing_hotness.entry(key).or_default();
+            let decision = if event.kind == rquickjs_core::qjs::JSJitHotKind_JS_JIT_HOT_CALL
+                && event.pc == 0
+            {
+                hotness.record_call_event_with_thresholds(event.count, thresholds)
+            } else if event.kind == rquickjs_core::qjs::JSJitHotKind_JS_JIT_HOT_LOOP
+                && event.pc != 0
+            {
+                hotness.record_loop_event_with_thresholds(event.count, thresholds)
+            } else {
+                return 0;
+            };
+            if matches!(decision, runtime::HotDecision::Queue(_)) {
+                self.optimizing_requested.insert(key);
+                self.snapshot_requests = self.snapshot_requests.saturating_add(1);
+                return 1;
+            }
+            return 0;
+        }
+        if matches!(
+            baseline_state,
+            runtime::CompileState::Blacklisted | runtime::CompileState::Installed(_)
+        ) {
+            self.requested.insert(key);
+            return 0;
+        }
+        if self
+            .prequeue_backoff
+            .get(&key)
+            .is_some_and(|(_, retry_after)| self.clock < *retry_after)
+        {
+            return 0;
+        }
+        if self.requested.contains(&key) {
+            return 0;
+        }
+        let hotness = self.hotness.entry(key).or_default();
+        // Task 14 owns evidence-based coefficients. Production still consumes
+        // the adaptive interface now, with its documented neutral inputs.
+        let adaptive = runtime::AdaptiveInputs::default().thresholds();
+        let thresholds = runtime::HotThresholds {
+            calls: self.config.call_threshold(),
+            loops: self.config.loop_threshold(),
+            rationale: adaptive.rationale,
+        };
+        let decision = if event.kind == rquickjs_core::qjs::JSJitHotKind_JS_JIT_HOT_CALL
+            && event.pc == 0
+        {
+            hotness.record_call_event_with_thresholds(event.count, thresholds)
+        } else if event.kind == rquickjs_core::qjs::JSJitHotKind_JS_JIT_HOT_LOOP && event.pc != 0 {
+            hotness.record_loop_event_with_thresholds(event.count, thresholds)
+        } else {
+            return 0;
+        };
+        if let runtime::HotDecision::Queue(reason) = decision {
+            self.requested.insert(key);
+            self.queue_reasons.insert(key, reason);
+            self.snapshot_requests = self.snapshot_requests.saturating_add(1);
+            1
+        } else {
+            0
+        }
+    }
+
+    fn record_feedback(&mut self, event: &rquickjs_core::qjs::JSJitFeedbackEvent) {
+        use rquickjs_core::qjs;
+
+        if event.struct_size < core::mem::size_of::<qjs::JSJitFeedbackEvent>() as u32
+            || event.function.id == 0
+            || event.function.generation == 0
+            || (event.type_count != 0 && event.types.is_null())
+        {
+            return;
+        }
+        let key = runtime::FunctionKey::new(event.function.id, event.function.generation);
+        if self.feedback_disabled.contains(&key) {
+            return;
+        }
+        let raw_types = if event.type_count == 0 {
+            &[][..]
+        } else {
+            // QuickJS guarantees this borrowed array remains live for the callback.
+            unsafe { core::slice::from_raw_parts(event.types, event.type_count as usize) }
+        };
+        let observed = |raw| match raw {
+            qjs::JSJitValueType_JS_JIT_VALUE_INT32 => Some(runtime::ObservedType::Int32),
+            qjs::JSJitValueType_JS_JIT_VALUE_FLOAT64 => Some(runtime::ObservedType::Float64),
+            qjs::JSJitValueType_JS_JIT_VALUE_BOOL => Some(runtime::ObservedType::Bool),
+            qjs::JSJitValueType_JS_JIT_VALUE_NULL => Some(runtime::ObservedType::Null),
+            qjs::JSJitValueType_JS_JIT_VALUE_UNDEFINED => Some(runtime::ObservedType::Undefined),
+            qjs::JSJitValueType_JS_JIT_VALUE_STRING => Some(runtime::ObservedType::String),
+            qjs::JSJitValueType_JS_JIT_VALUE_OBJECT => Some(runtime::ObservedType::Object),
+            qjs::JSJitValueType_JS_JIT_VALUE_BIGINT => Some(runtime::ObservedType::BigInt),
+            qjs::JSJitValueType_JS_JIT_VALUE_SYMBOL => Some(runtime::ObservedType::Symbol),
+            _ => None,
+        };
+        self.clock = self.clock.saturating_add(1).max(1);
+        match event.kind {
+            qjs::JSJitFeedbackKind_JS_JIT_FEEDBACK_CALL => {
+                let arguments = &mut self.call_feedback_types;
+                arguments.clear();
+                arguments.reserve(raw_types.len());
+                for &raw in raw_types {
+                    let Some(value) = observed(raw) else {
+                        // Reject the entire event before mutating feedback.
+                        return;
+                    };
+                    arguments.push(value);
+                }
+                if event.flags & qjs::JS_JIT_FEEDBACK_CALL_SITE != 0 {
+                    let Some((&result, arguments)) = arguments.split_last() else {
+                        return;
+                    };
+                    if event.callee.id == 0 || event.callee.generation == 0 {
+                        return;
+                    }
+                    let callee =
+                        runtime::FunctionKey::new(event.callee.id, event.callee.generation);
+                    self.feedback.observe_call_signature_with_identity(
+                        key,
+                        event.pc,
+                        callee,
+                        event.shape_identity,
+                        event.prototype_identity,
+                        arguments,
+                        result,
+                    );
+                } else {
+                    self.feedback.observe_call(key, arguments);
+                }
+            }
+            qjs::JSJitFeedbackKind_JS_JIT_FEEDBACK_RETURN if raw_types.len() == 1 => {
+                if let Some(result) = observed(raw_types[0]) {
+                    self.feedback.observe_return(key, event.pc, result);
+                }
+            }
+            qjs::JSJitFeedbackKind_JS_JIT_FEEDBACK_BINARY if raw_types.len() == 3 => {
+                if let (Some(lhs), Some(rhs), Some(result)) = (
+                    observed(raw_types[0]),
+                    observed(raw_types[1]),
+                    observed(raw_types[2]),
+                ) {
+                    let mut flags = runtime::BinaryFeedbackFlags::NONE;
+                    if event.flags & qjs::JS_JIT_FEEDBACK_OVERFLOW != 0 {
+                        flags |= runtime::BinaryFeedbackFlags::OVERFLOW;
+                    }
+                    if event.flags & qjs::JS_JIT_FEEDBACK_NEGATIVE_ZERO != 0 {
+                        flags |= runtime::BinaryFeedbackFlags::NEGATIVE_ZERO;
+                    }
+                    if event.flags & qjs::JS_JIT_FEEDBACK_NAN != 0 {
+                        flags |= runtime::BinaryFeedbackFlags::NAN;
+                    }
+                    self.feedback
+                        .observe_binary(key, event.pc, lhs, rhs, result, flags);
+                }
+            }
+            qjs::JSJitFeedbackKind_JS_JIT_FEEDBACK_CONVERSION if raw_types.len() == 2 => {
+                if let (Some(operand), Some(result)) =
+                    (observed(raw_types[0]), observed(raw_types[1]))
+                {
+                    self.feedback
+                        .observe_conversion(key, event.pc, operand, result);
+                }
+            }
+            qjs::JSJitFeedbackKind_JS_JIT_FEEDBACK_BRANCH if raw_types.len() == 1 => {
+                if let Some(condition) = observed(raw_types[0]) {
+                    self.feedback.observe_branch(
+                        key,
+                        event.pc,
+                        condition,
+                        event.flags & qjs::JS_JIT_FEEDBACK_BRANCH_TAKEN != 0,
+                    );
+                }
+            }
+            qjs::JSJitFeedbackKind_JS_JIT_FEEDBACK_PROPERTY
+                if raw_types.len() == 2
+                    && event.shape_identity != 0
+                    && event.shape_generation != 0 =>
+            {
+                let observation = runtime::ShapeObservation::new(
+                    runtime::ShapeToken::new(event.shape_identity, event.shape_generation),
+                    runtime::PrototypeDependencyToken::new(
+                        event.prototype_identity,
+                        event.prototype_generation,
+                    ),
+                    event.property_offset,
+                    runtime::PropertyAttributes::from_bits(event.property_attributes as u8),
+                    observed(raw_types[1]).unwrap_or(runtime::ObservedType::Object),
+                );
+                self.shape_feedback.observe(key, event.pc, observation);
+            }
+            _ => {}
+        }
+    }
+
+    fn submit_snapshot(&mut self, snapshot: *mut rquickjs_core::qjs::JSJitFunctionSnapshot) {
+        struct FreeSnapshot(*mut rquickjs_core::qjs::JSJitFunctionSnapshot);
+        impl Drop for FreeSnapshot {
+            fn drop(&mut self) {
+                unsafe { rquickjs_core::qjs::JS_JitFreeSnapshot(self.0) };
+            }
+        }
+        let Some(raw) = std::ptr::NonNull::new(snapshot) else {
+            return;
+        };
+        let raw_key = unsafe {
+            runtime::FunctionKey::new(raw.as_ref().function.id, raw.as_ref().function.generation)
+        };
+        let _free = FreeSnapshot(snapshot);
+        let copied = unsafe { bytecode::CompileSnapshot::copy_borrowed_raw(raw.as_ref()) };
+        let Ok(snapshot) = copied else {
+            self.feedback_disabled.insert(raw_key);
+            self.fail_before_queue(raw_key);
+            return;
+        };
+        let key = runtime::FunctionKey::new(snapshot.function_id(), snapshot.generation());
+        if snapshot.owned_bytes() > self.config.max_snapshot_bytes() {
+            // The configured copy budget is a transient admission failure, not
+            // a property of this immutable bytecode generation.  Keep hot
+            // probes enabled so `fail_before_queue` can perform its bounded
+            // prequeue retries.
+            self.coordinator.record_resource_limit_rejection();
+            self.fail_before_queue(key);
+            self.maintenance();
+            return;
+        }
+        let Ok(verified) = snapshot.verify(bytecode::VerifyLimits::default()) else {
+            self.feedback_disabled.insert(key);
+            self.fail_before_queue(key);
+            return;
+        };
+        if let Err(rejection) = verified.tier1_eligibility() {
+            self.coordinator
+                .reject_tier1(key, runtime::Tier::Baseline, rejection.reason());
+            self.feedback_disabled.insert(key);
+            self.clear_failed_request(key);
+            self.maintenance();
+            return;
+        }
+        self.ensure_artifact_environment();
+        let adaptive = runtime::AdaptiveInputs {
+            bytecode_bytes: verified
+                .snapshot()
+                .bytecode()
+                .len()
+                .try_into()
+                .unwrap_or(u32::MAX),
+            helper_ops: 0,
+            instruction_count: verified.instructions().len().try_into().unwrap_or(u32::MAX),
+            measured_work: None,
+        };
+        let profile = self.execution_profiles.entry(key).or_default();
+        profile.bytecodes = verified.instructions().len().try_into().unwrap_or(u64::MAX);
+        profile.helper_calls = verified
+            .instructions()
+            .iter()
+            .filter(|instruction| {
+                matches!(
+                    bytecode::tier1_policy(instruction.opcode().id()),
+                    Some(bytecode::Tier1Policy::Helper(_))
+                )
+            })
+            .count()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        self.adaptive_inputs_recorded = self.adaptive_inputs_recorded.saturating_add(1);
+        debug_assert_eq!(
+            adaptive.thresholds().rationale,
+            runtime::HotReason::NeutralBase
+        );
+        if self.optimizing_requested.remove(&key) {
+            if let Some(hotness) = self.optimizing_hotness.get_mut(&key) {
+                hotness.clear_queued();
+            }
+            /* Optimizing snapshots must acquire the current bounded feedback
+             * in maintenance. Directly queueing this callback result uses the
+             * feedback-free coordinator path and races the RETURN event that
+             * completes the numeric signature. */
+            self.optimizing_snapshots.insert(key, verified);
+            self.maintenance();
+            return;
+        }
+        let requested_tier = runtime::Tier::Baseline;
+        let tier2_snapshot = Some(verified.clone());
+        let feedback = self.feedback.snapshot(self.clock);
+        let queued = self
+            .coordinator
+            .queue_with_feedback(key, requested_tier, verified, feedback);
+        match queued {
+            Ok(()) => {
+                match self.queue_reasons.get(&key).copied() {
+                    Some(runtime::HotReason::CallThreshold) => {
+                        self.hot_call_queues = self.hot_call_queues.saturating_add(1);
+                    }
+                    Some(runtime::HotReason::LoopThreshold) => {
+                        self.hot_loop_queues = self.hot_loop_queues.saturating_add(1);
+                    }
+                    _ => {}
+                }
+                self.adaptive_neutral_queues = self.adaptive_neutral_queues.saturating_add(1);
+                self.prequeue_backoff.remove(&key);
+                if let Some(snapshot) = tier2_snapshot {
+                    self.optimizing_snapshots.insert(key, snapshot);
+                }
+            }
+            Err(runtime::QueueError::Blacklisted | runtime::QueueError::NotReady) => {
+                // An active/installed/blacklisted coordinator state owns the
+                // request bit; retaining it prevents duplicate snapshots.
+                self.requested.insert(key);
+            }
+            Err(runtime::QueueError::Retired | runtime::QueueError::Shutdown) => {
+                self.clear_failed_request(key);
+            }
+            Err(_) => self.fail_before_queue(key),
+        }
+        self.maintenance();
+    }
+
+    fn acquire_entry(
+        &mut self,
+        id: u64,
+        generation: u64,
+        pc: u32,
+    ) -> rquickjs_core::qjs::JSJitEntryHandle {
+        let mut empty = rquickjs_core::qjs::JSJitEntryHandle {
+            struct_size: core::mem::size_of::<rquickjs_core::qjs::JSJitEntryHandle>() as u32,
+            reserved: 0,
+            entry: None,
+            pin: core::ptr::null_mut(),
+            stack_map_count: 0,
+            helper_abi_version: 0,
+        };
+        let key = runtime::FunctionKey::new(id, generation);
+        if self.feedback_disabled.contains(&key) {
+            return empty;
+        }
+        // Profitability-demoted functions have no publishable native entry.
+        // Avoid running global maintenance at every subsequent call/OSR probe;
+        // this keeps the fail-open interpreter path close to unattached cost.
+        if self.profitability_blacklisted.contains(&key)
+            && !matches!(
+                self.coordinator.tier_state(key, runtime::Tier::Optimizing),
+                runtime::CompileState::Installed(_)
+            )
+        {
+            return empty;
+        }
+        self.maintenance_if_due(false);
+        let acquired_tier = if matches!(
+            self.coordinator.tier_state(key, runtime::Tier::Optimizing),
+            runtime::CompileState::Installed(_)
+        ) {
+            runtime::Tier::Optimizing
+        } else {
+            runtime::Tier::Baseline
+        };
+        let Some(pin) = self.coordinator.pin(key, acquired_tier) else {
+            if pc != 0 {
+                self.osr_not_ready = self.osr_not_ready.saturating_add(1);
+            }
+            return empty;
+        };
+        let Some(published) = pin.artifact().published() else {
+            if pc != 0 {
+                self.osr_not_ready = self.osr_not_ready.saturating_add(1);
+            }
+            return empty;
+        };
+        let (published, osr_map) = if pc == 0 {
+            (published, None)
+        } else {
+            let Some((map, osr)) = published.osr_entry(pc) else {
+                self.osr_map_misses = self.osr_map_misses.saturating_add(1);
+                return empty;
+            };
+            if map.key().function() != runtime::FunctionKey::new(id, generation) {
+                self.osr_map_misses = self.osr_map_misses.saturating_add(1);
+                return empty;
+            }
+            (osr, Some(map.clone()))
+        };
+        #[cfg(feature = "test-support")]
+        {
+            *self
+                .test_last_acquired_key
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(pin.artifact().key());
+        }
+        let entry = published.as_ptr();
+        let stack_map_count = published.required_stack_map_count();
+        let artifact_key = pin.artifact().key();
+        let pin = Box::into_raw(Box::new(ProductionEntryPin {
+            execution: pin,
+            native: entry,
+            runtime_id: artifact_key.runtime_id,
+            key: runtime::FunctionKey::new(id, generation),
+            pc,
+            stack_map_count,
+            osr: osr_map,
+            validation: Arc::clone(&self.osr_validation),
+            #[cfg(feature = "test-support")]
+            stress_gc: self.config.stress_gc(),
+        }))
+        .cast();
+        empty.entry = Some(production_entry_trampoline);
+        empty.pin = pin;
+        empty.stack_map_count = stack_map_count;
+        empty.helper_abi_version = rquickjs_core::qjs::QJSJIT_HELPER_ABI_VERSION;
+        self.entry_tiers.insert(key, acquired_tier);
+        self.native_acquisitions = self.native_acquisitions.saturating_add(1);
+        empty
+    }
+
+    fn entry_cache_epoch(&self) -> u64 {
+        if self.coordinator.has_pending_work()
+            || self.feedback.version() != self.last_scan_feedback_version
+            || self.coordinator.installed_count() != self.last_scan_installed
+        {
+            // Force acquisition through maintenance when the admission inputs
+            // changed since the last scan, even before the next hot probe.
+            0
+        } else {
+            self.entry_cache_epoch
+        }
+    }
+
+    fn release_entry(&mut self, entry: rquickjs_core::qjs::JSJitEntryHandle) {
+        if !entry.pin.is_null() {
+            unsafe { drop(Box::from_raw(entry.pin.cast::<ProductionEntryPin>())) };
+        }
+    }
+
+    fn native_enter(&mut self, _id: u64, _generation: u64, pc: u32) {
+        self.native_entries = self.native_entries.saturating_add(1);
+        let key = runtime::FunctionKey::new(_id, _generation);
+        let tier = self
+            .entry_tiers
+            .get(&key)
+            .copied()
+            .unwrap_or(runtime::Tier::Baseline);
+        if tier == runtime::Tier::Optimizing {
+            self.coordinator.record_tier2_entry();
+        }
+        if pc != 0 {
+            self.osr_attempts = self.osr_attempts.saturating_add(1);
+        }
+        self.execution_starts
+            .push((key, std::time::Instant::now(), tier));
+    }
+
+    fn native_exit(&mut self, id: u64, generation: u64, pc: u32, exit_kind: u32) {
+        self.native_exits = self.native_exits.saturating_add(1);
+        let key = runtime::FunctionKey::new(id, generation);
+        if exit_kind == rquickjs_core::qjs::JSJitExitKind_JS_JIT_EXIT_DONE {
+            if let Some(observed) = self.osr_validation.take_native_return(id, generation) {
+                // Native returns complete the call signature exactly like the
+                // interpreter's OP_return feedback; the sentinel pc keeps them
+                // apart from bytecode return sites and deopt guard pcs.
+                self.feedback
+                    .observe_return(key, NATIVE_RETURN_FEEDBACK_PC, observed);
+            }
+        }
+        // An unmatched callback must not discard a different active timer.
+        // Actual C invocations, including recursive and OSR entries, are LIFO.
+        if let Some((_, start, tier)) = self
+            .execution_starts
+            .last()
+            .copied()
+            .filter(|(active, _, _)| *active == key)
+        {
+            self.execution_starts.pop();
+            let elapsed = start.elapsed().as_nanos().try_into().unwrap_or(u64::MAX);
+            let optimized = tier == runtime::Tier::Optimizing;
+            let profile = self.execution_profiles.entry(key).or_default();
+            if optimized {
+                profile.optimized_executions = profile.optimized_executions.saturating_add(1);
+                profile.optimized_ns = profile.optimized_ns.saturating_add(elapsed);
+                if exit_kind == rquickjs_core::qjs::JSJitExitKind_JS_JIT_EXIT_DONE {
+                    if let Some(baseline_average) =
+                        profile.baseline_ns.checked_div(profile.baseline_executions)
+                    {
+                        let saved = baseline_average.saturating_sub(elapsed);
+                        if saved != 0
+                            && self.coordinator.record_benefit(
+                                key,
+                                runtime::Tier::Optimizing,
+                                saved,
+                            )
+                        {
+                            self.benefit_recordings = self.benefit_recordings.saturating_add(1);
+                            self.measured_benefit_ns =
+                                self.measured_benefit_ns.saturating_add(saved);
+                        }
+                    }
+                }
+            } else {
+                profile.baseline_executions = profile.baseline_executions.saturating_add(1);
+                profile.baseline_ns = profile.baseline_ns.saturating_add(elapsed);
+            }
+        }
+        self.coordinator
+            .record_side_path_entries(self.osr_validation.take_side_path_entries());
+        if exit_kind == rquickjs_core::qjs::JSJitExitKind_JS_JIT_EXIT_RETRY_INTERPRETER {
+            self.native_retries = self.native_retries.saturating_add(1);
+            let validation_retry = self
+                .osr_validation
+                .take_validation_retry(id, generation, pc);
+            if is_generated_osr_retry(pc, exit_kind, validation_retry) {
+                self.osr_generated_retries = self.osr_generated_retries.saturating_add(1);
+            }
+        } else if exit_kind == rquickjs_core::qjs::JSJitExitKind_JS_JIT_EXIT_DEOPT {
+            // Side-exit accounting can unpublish optimizing code immediately,
+            // before the next maintenance pass. Invalidate handles belonging
+            // to still-active recursive frames before they can be cached again.
+            self.invalidate_entry_cache();
+            self.native_fallbacks = self.native_fallbacks.saturating_add(1);
+            let key = runtime::FunctionKey::new(id, generation);
+            if let Some((guard, observed)) = self.osr_validation.take_deopt_guard(id, generation) {
+                if self
+                    .coordinator
+                    .record_optimized_side_exit_profile(key, guard, observed)
+                    == runtime::SideExitAction::StablePathThreshold
+                {
+                    if let Some(snapshot) = self.tier2_sources.get(&key).cloned() {
+                        let guard_pc = self
+                            .coordinator
+                            .pin(key, runtime::Tier::Optimizing)
+                            .and_then(|pin| {
+                                pin.artifact().optimized_metadata().and_then(|metadata| {
+                                    metadata.deopt_sites().iter().find_map(|(_, map)| {
+                                        (map.guard() == guard).then_some(map.resume_pc())
+                                    })
+                                })
+                            });
+                        if let (Some(guard_pc), Some(observed)) = (guard_pc, observed) {
+                            self.feedback.observe_type(
+                                key,
+                                guard_pc,
+                                runtime::FeedbackKind::Exit,
+                                observed,
+                            );
+                        }
+                        let feedback = self.feedback.snapshot(self.clock.max(1));
+                        let profile = guard_pc.zip(observed).map(|(guard_pc, observed)| {
+                            runtime::SidePathProfile::new(
+                                key,
+                                runtime::GuardId::new(guard),
+                                guard_pc,
+                                observed,
+                                feedback.epoch(),
+                            )
+                        });
+                        if profile.is_some_and(|profile| {
+                            self.coordinator
+                                .queue_side_path(key, snapshot, feedback, profile)
+                                .is_ok()
+                        }) {
+                            self.stable_path_compile_requests =
+                                self.stable_path_compile_requests.saturating_add(1);
+                        }
+                    }
+                }
+            } else {
+                self.coordinator.record_deopt(true);
+            }
+        }
+        self.maintenance_if_due(true);
+    }
+
+    fn function_retire(&mut self, id: u64, generation: u64) {
+        let key = runtime::FunctionKey::new(id, generation);
+        self.requested.remove(&key);
+        self.queue_reasons.remove(&key);
+        self.prequeue_backoff.remove(&key);
+        self.hotness.remove(&key);
+        self.optimizing_requested.remove(&key);
+        self.optimizing_hotness.remove(&key);
+        self.optimizing_snapshots.remove(&key);
+        self.tier2_sources.remove(&key);
+        self.entry_tiers.remove(&key);
+        self.coordinator.retire(key);
+        self.maintenance();
+    }
+
+    fn runtime_detach(&mut self) {
+        self.workers.shutdown(&mut self.coordinator);
+        self.coordinator.shutdown();
+        self.maintenance();
+    }
+
+    fn memory_used(&self) -> usize {
+        self.coordinator.cache_bytes()
+    }
+}
+
+/// Builder for an owning [`JitRuntime`].
+#[derive(Clone, Debug, Default)]
+pub struct JitRuntimeBuilder {
+    config: JitConfig,
+}
+
+impl JitRuntimeBuilder {
+    /// Sets the JIT policy and resource limits.
+    pub fn config(mut self, config: JitConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Constructs a QuickJS runtime with an attached JIT backend.
+    pub fn build(self) -> Result<JitRuntime, JitError> {
+        let runtime = Runtime::new()?;
+        let jit = Jit::attach(&runtime, self.config)?;
+        Ok(JitRuntime {
+            jit: Some(jit),
+            runtime: Some(runtime),
+        })
+    }
+
+    /// Constructs a plain QuickJS interpreter without attaching a JIT backend.
+    ///
+    /// This is useful for differential tests and benchmarks that need an
+    /// interpreter baseline without profiling, snapshot, or compiler overhead.
+    pub fn build_interpreter(self) -> Result<JitRuntime, JitError> {
+        let runtime = Runtime::new()?;
+        Ok(JitRuntime {
+            jit: None,
+            runtime: Some(runtime),
+        })
+    }
+}
+
+/// An owning QuickJS runtime paired with its JIT guard.
+pub struct JitRuntime {
+    jit: Option<Jit>,
+    runtime: Option<Runtime>,
+}
+
+impl JitRuntime {
+    /// Starts building an owning JIT runtime.
+    pub fn builder() -> JitRuntimeBuilder {
+        JitRuntimeBuilder::default()
+    }
+
+    /// Returns whether this runtime owns an attached JIT backend.
+    pub const fn has_jit(&self) -> bool {
+        self.jit.is_some()
+    }
+
+    /// Returns the attached JIT guard.
+    ///
+    /// Panics when this runtime was created with
+    /// [`JitRuntimeBuilder::build_interpreter`].
+    pub const fn jit(&self) -> &Jit {
+        match &self.jit {
+            Some(jit) => jit,
+            None => panic!("interpreter runtime has no JIT guard"),
+        }
+    }
+
+    /// Returns runtime metrics, or disabled zero metrics for an interpreter.
+    pub fn metrics(&self) -> JitMetrics {
+        match &self.jit {
+            Some(jit) => jit.metrics(),
+            None => JitMetrics::disabled(),
+        }
+    }
+}
+
+impl Deref for JitRuntime {
+    type Target = Runtime;
+
+    fn deref(&self) -> &Self::Target {
+        self.runtime
+            .as_ref()
+            .expect("QuickJS runtime is present until drop")
+    }
+}
+
+fn drop_jit_before_runtime<J, R>(jit: &mut Option<J>, runtime: &mut Option<R>) {
+    drop(jit.take());
+    drop(runtime.take());
+}
+
+impl Drop for JitRuntime {
+    fn drop(&mut self) {
+        drop_jit_before_runtime(&mut self.jit, &mut self.runtime);
+    }
+}
+
+#[cfg(test)]
+mod jit_runtime_drop_tests {
+    use super::{drop_jit_before_runtime, JitRuntime};
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn reports_whether_a_jit_backend_is_attached() {
+        let automatic = JitRuntime::builder().build().unwrap();
+        let interpreter = JitRuntime::builder().build_interpreter().unwrap();
+
+        assert!(automatic.has_jit());
+        assert!(!interpreter.has_jit());
+    }
+
+    struct DropProbe {
+        label: &'static str,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.events.lock().unwrap().push(self.label);
+        }
+    }
+
+    #[test]
+    fn owning_runtime_drops_jit_guard_before_quickjs_runtime() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut jit = Some(DropProbe {
+            label: "jit",
+            events: Arc::clone(&events),
+        });
+        let mut runtime = Some(DropProbe {
+            label: "runtime",
+            events: Arc::clone(&events),
+        });
+
+        drop_jit_before_runtime(&mut jit, &mut runtime);
+
+        assert_eq!(*events.lock().unwrap(), ["jit", "runtime"]);
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "compiler",
+    any(
+        all(
+            target_os = "macos",
+            target_endian = "little",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "windows",
+            target_endian = "little",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "linux",
+            target_endian = "little",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
+))]
+mod production_environment_tests {
+    use super::*;
+
+    // Count allocations on this test thread only; background compilers and
+    // concurrently running tests keep using the system allocator unobserved.
+    struct CountingAllocator;
+    std::thread_local! {
+        static ALLOCATIONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
+    #[global_allocator]
+    static TEST_ALLOCATOR: CountingAllocator = CountingAllocator;
+    unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            let _ = ALLOCATIONS.try_with(|count| {
+                if let Some(n) = count.get() {
+                    count.set(Some(n + 1));
+                }
+            });
+            unsafe { std::alloc::GlobalAlloc::alloc(&std::alloc::System, layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            unsafe { std::alloc::GlobalAlloc::dealloc(&std::alloc::System, ptr, layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+            let _ = ALLOCATIONS.try_with(|count| {
+                if let Some(n) = count.get() {
+                    count.set(Some(n + 1));
+                }
+            });
+            unsafe { std::alloc::GlobalAlloc::realloc(&std::alloc::System, ptr, layout, size) }
+        }
+    }
+
+    fn call_event(types: &[u32], callsite: bool) -> rquickjs_core::qjs::JSJitFeedbackEvent {
+        use rquickjs_core::qjs;
+        // All-zero scalar fields and a null pointer are valid for this C event.
+        let mut event: qjs::JSJitFeedbackEvent = unsafe { core::mem::zeroed() };
+        event.struct_size = core::mem::size_of_val(&event) as u32;
+        event.kind = qjs::JSJitFeedbackKind_JS_JIT_FEEDBACK_CALL;
+        event.function.id = 7;
+        event.function.generation = 3;
+        event.callee.id = 8;
+        event.callee.generation = 4;
+        event.pc = 12;
+        event.types = types.as_ptr();
+        event.type_count = types.len() as u32;
+        if callsite {
+            event.flags = qjs::JS_JIT_FEEDBACK_CALL_SITE;
+        }
+        event
+    }
+
+    #[test]
+    fn sequential_native_entries_reuse_timing_storage_across_functions() {
+        use rquickjs_core::{qjs, runtime::JitBackend};
+        let mut backend = ProductionBackend::new(
+            1,
+            &abi::AbiInfo::linked().unwrap(),
+            JitConfig::default(),
+            Arc::new(Mutex::new(JitMetrics::default())),
+        )
+        .unwrap();
+        backend.native_enter(1, 1, 0);
+        backend.native_exit(1, 1, 0, qjs::JSJitExitKind_JS_JIT_EXIT_DONE);
+        let mut allocations = 0;
+        for id in 2..102 {
+            ALLOCATIONS.with(|count| count.set(Some(0)));
+            backend.native_enter(id, 1, 0);
+            allocations += ALLOCATIONS.with(|count| count.replace(None).unwrap());
+            // Profile creation on exit is separate from storing an active timer.
+            backend.native_exit(id, 1, 0, qjs::JSJitExitKind_JS_JIT_EXIT_DONE);
+        }
+        assert_eq!(
+            allocations, 0,
+            "sequential entries must reuse warmed timing storage"
+        );
+        assert_eq!((backend.native_entries, backend.native_exits), (101, 101));
+        backend.runtime_detach();
+    }
+
+    #[test]
+    fn native_timing_preserves_recursive_tiers_across_retirement_and_exit_kinds() {
+        use rquickjs_core::{qjs, runtime::JitBackend};
+        use runtime::{FunctionKey, Tier};
+        let mut backend = ProductionBackend::new(
+            1,
+            &abi::AbiInfo::linked().unwrap(),
+            JitConfig::default(),
+            Arc::new(Mutex::new(JitMetrics::default())),
+        )
+        .unwrap();
+        let outer = FunctionKey::new(7, 3);
+        let inner = FunctionKey::new(8, 4);
+        backend.entry_tiers.insert(outer, Tier::Baseline);
+        backend.native_enter(7, 3, 0);
+        backend.entry_tiers.insert(inner, Tier::Optimizing);
+        backend.native_enter(8, 4, 12);
+        backend.entry_tiers.insert(outer, Tier::Optimizing);
+        backend.native_enter(7, 3, 0);
+        backend.function_retire(7, 3);
+        backend.native_exit(7, 3, 0, qjs::JSJitExitKind_JS_JIT_EXIT_DEOPT);
+        backend.native_exit(8, 4, 12, qjs::JSJitExitKind_JS_JIT_EXIT_RETRY_INTERPRETER);
+        backend.native_exit(7, 3, 0, qjs::JSJitExitKind_JS_JIT_EXIT_DONE);
+        let a = backend.execution_profiles[&outer];
+        let b = backend.execution_profiles[&inner];
+        assert_eq!((a.baseline_executions, a.optimized_executions), (1, 1));
+        assert_eq!((b.baseline_executions, b.optimized_executions), (0, 1));
+        assert_eq!(
+            (
+                backend.native_entries,
+                backend.native_exits,
+                backend.osr_attempts
+            ),
+            (3, 3, 1)
+        );
+        backend.runtime_detach();
+    }
+
+    #[test]
+    fn unmatched_native_exit_does_not_consume_another_active_timer() {
+        use rquickjs_core::{qjs, runtime::JitBackend};
+        use runtime::FunctionKey;
+        let mut backend = ProductionBackend::new(
+            1,
+            &abi::AbiInfo::linked().unwrap(),
+            JitConfig::default(),
+            Arc::new(Mutex::new(JitMetrics::default())),
+        )
+        .unwrap();
+        backend.native_exit(99, 1, 0, qjs::JSJitExitKind_JS_JIT_EXIT_DONE);
+        backend.native_enter(7, 3, 0);
+        backend.native_enter(8, 4, 0);
+        // Defensive behavior for invalid callback order; C's real pairs are LIFO.
+        backend.native_exit(7, 3, 0, qjs::JSJitExitKind_JS_JIT_EXIT_DONE);
+        assert!(!backend
+            .execution_profiles
+            .contains_key(&FunctionKey::new(7, 3)));
+        backend.native_exit(8, 4, 0, qjs::JSJitExitKind_JS_JIT_EXIT_EXCEPTION);
+        backend.native_exit(7, 3, 0, qjs::JSJitExitKind_JS_JIT_EXIT_DONE);
+        assert_eq!(
+            backend.execution_profiles[&FunctionKey::new(7, 3)].baseline_executions,
+            1
+        );
+        assert_eq!(
+            backend.execution_profiles[&FunctionKey::new(8, 4)].baseline_executions,
+            1
+        );
+        assert!(!backend
+            .execution_profiles
+            .contains_key(&FunctionKey::new(99, 1)));
+        backend.runtime_detach();
+    }
+
+    #[test]
+    fn stable_call_feedback_does_not_allocate_after_warmup() {
+        use rquickjs_core::{qjs, runtime::JitBackend};
+        let mut backend = ProductionBackend::new(
+            1,
+            &abi::AbiInfo::linked().unwrap(),
+            JitConfig::default(),
+            Arc::new(Mutex::new(JitMetrics::default())),
+        )
+        .unwrap();
+        let types = [qjs::JSJitValueType_JS_JIT_VALUE_INT32; 32];
+        for callsite in [false, true] {
+            let event = call_event(&types, callsite);
+            backend.record_feedback(&event);
+            ALLOCATIONS.with(|count| count.set(Some(0)));
+            for _ in 0..100 {
+                backend.record_feedback(&event);
+            }
+            let allocations = ALLOCATIONS.with(|count| count.replace(None).unwrap());
+            assert_eq!(allocations, 0, "stable CALL event must reuse storage");
+        }
+        backend.runtime_detach();
+    }
+
+    #[test]
+    fn call_feedback_preserves_wide_arguments_and_rejects_entire_invalid_events() {
+        use rquickjs_core::{qjs, runtime::JitBackend};
+        use runtime::{FunctionKey, ObservedType};
+        let mut backend = ProductionBackend::new(
+            1,
+            &abi::AbiInfo::linked().unwrap(),
+            JitConfig::default(),
+            Arc::new(Mutex::new(JitMetrics::default())),
+        )
+        .unwrap();
+        let key = FunctionKey::new(7, 3);
+        let mut types = vec![qjs::JSJitValueType_JS_JIT_VALUE_INT32; 32];
+        types[0] = qjs::JSJitValueType_JS_JIT_VALUE_BOOL;
+        types[31] = qjs::JSJitValueType_JS_JIT_VALUE_STRING;
+        backend.record_feedback(&call_event(&types, false));
+        backend.record_feedback(&call_event(&types, true));
+        let snapshot = backend.feedback.snapshot(1);
+        let call = snapshot.call_at(key).unwrap();
+        assert_eq!(call.argc(), 32);
+        assert_eq!(call.argument(0), [ObservedType::Bool]);
+        assert_eq!(call.argument(30), [ObservedType::Int32]);
+        assert_eq!(call.argument(31), [ObservedType::String]);
+        let site = snapshot.call_signature_at(key, 12).unwrap();
+        assert_eq!(site.targets(), [FunctionKey::new(8, 4)]);
+        assert_eq!(site.argument(0), [ObservedType::Bool]);
+        assert_eq!(site.argument(30), [ObservedType::Int32]);
+        assert!(site.argument(31).is_empty());
+        assert_eq!(site.results(), [ObservedType::String]);
+        types[0] = qjs::JSJitValueType_JS_JIT_VALUE_OBJECT;
+        types[31] = u32::MAX;
+        for callsite in [false, true] {
+            backend.record_feedback(&call_event(&types, callsite));
+            assert_eq!(backend.feedback.snapshot(1), snapshot);
+        }
+        // A subsequent short event cannot inherit any stale scratch slots.
+        backend.record_feedback(&call_event(&[qjs::JSJitValueType_JS_JIT_VALUE_BOOL], true));
+        assert_eq!(
+            backend
+                .feedback
+                .snapshot(1)
+                .call_signature_at(key, 12)
+                .unwrap()
+                .results(),
+            [ObservedType::String, ObservedType::Bool]
+        );
+        backend.runtime_detach();
+    }
+
+    #[test]
+    fn deopt_demotions_invalidate_entry_cache_before_periodic_maintenance() {
+        use rquickjs_core::runtime::JitBackend;
+        let mut backend = ProductionBackend::new(
+            1,
+            &abi::AbiInfo::linked().unwrap(),
+            JitConfig::default(),
+            Arc::new(Mutex::new(JitMetrics::default())),
+        )
+        .unwrap();
+        backend.maintenance();
+        let epoch = backend.entry_cache_epoch();
+        assert_ne!(epoch, 0);
+        for guard in [1, 2] {
+            backend.osr_validation.mark_deopt_guard(7, 3, guard, None);
+            backend.native_exit(7, 3, 0, rquickjs_core::qjs::JSJitExitKind_JS_JIT_EXIT_DEOPT);
+        }
+        assert_eq!(backend.coordinator.metrics().optimized_demotions, 1);
+        assert_eq!(backend.hot_ticks_since_maintenance, 2);
+        assert_ne!(backend.entry_cache_epoch(), epoch);
+        backend.runtime_detach();
+    }
+
+    #[test]
+    fn artifact_environment_uses_runtime_abi_target_features_and_config() {
+        let first = Runtime::new().unwrap();
+        let second = Runtime::new().unwrap();
+        let info = abi::AbiInfo::linked().unwrap();
+        let compiler = compiler::baseline::BaselineCompiler::host();
+        let base = artifact_environment(
+            first.jit_runtime_id(),
+            &info,
+            &JitConfig::default(),
+            &compiler,
+        );
+        let other_runtime = artifact_environment(
+            second.jit_runtime_id(),
+            &info,
+            &JitConfig::default(),
+            &compiler,
+        );
+        let other_config = artifact_environment(
+            first.jit_runtime_id(),
+            &info,
+            &JitConfig::builder().call_threshold(99).build().unwrap(),
+            &compiler,
+        );
+        assert_ne!(base.runtime_id, other_runtime.runtime_id);
+        assert_ne!(base.runtime_id, 0);
+        assert_ne!(base.target_isa, 0);
+        assert_eq!(
+            base.target_isa,
+            compiler.target_identity().triple_fingerprint()
+        );
+        assert_eq!(
+            base.cpu_features,
+            compiler.target_identity().codegen_fingerprint()
+        );
+        assert_ne!(base.abi_fingerprint, 0);
+        assert_ne!(base.config_fingerprint, other_config.config_fingerprint);
+        assert_ne!(base.cpu_features, 0);
+    }
+}
