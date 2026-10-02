@@ -19,7 +19,7 @@ jobs:
           toolchain: stable
       - run: cargo test -p quickjs-jit-stdlib
       - run: cargo test -p quickjs-jit-stdlib --all-features
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
       - run: python scripts/check-stdlib-jit.py
