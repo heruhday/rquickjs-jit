@@ -36,7 +36,7 @@ windows-sys = { version = "0.61", features = [
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 cranelift-codegen = { version = "0.116", optional = true, features = ["x86", "arm64", "enable-serde"] }
-cranelift-frontend = { version = "0.116", optional = true }
+cranelift-frontend = { version = "0.136", optional = true }
 cranelift-module = { version = "0.116", optional = true }
 cranelift-object = { version = "0.116", optional = true }
 cranelift-native = { version = "0.116", optional = true }
