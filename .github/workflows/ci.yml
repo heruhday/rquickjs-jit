@@ -176,7 +176,7 @@ jobs:
           cargo +nightly fuzz run differential corpus/differential -- -runs=16 -artifact_prefix=../../target/jit-fuzz-artifacts/differential- -print_final_stats=1 2>&1 | tee ../../target/jit-fuzz-logs/differential.log
       - name: Upload fuzz logs and reproducers
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: jit-fuzz-${{ github.run_id }}
           path: |
